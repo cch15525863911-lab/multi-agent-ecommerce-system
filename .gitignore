@@ -1,6 +1,13 @@
 # Environment
 .env
 *.env.local
+*.env.production
+
+# Secrets / Keys
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Python
 __pycache__/

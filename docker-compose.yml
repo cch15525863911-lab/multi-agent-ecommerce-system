@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # Python API Server
   api:
@@ -9,14 +7,31 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - ECOM_LLM_API_KEY=${ECOM_LLM_API_KEY:-your_api_key_here}
-      - ECOM_LLM_BASE_URL=${ECOM_LLM_BASE_URL:-https://api.minimax.chat/v1}
-      - ECOM_LLM_MODEL=${ECOM_LLM_MODEL:-MiniMax-M1}
+      - ECOM_LLM_PROVIDER=${ECOM_LLM_PROVIDER:-cloud}
+      - ECOM_LLM_API_KEY=${ECOM_LLM_API_KEY:-}
+      - ECOM_LLM_BASE_URL=${ECOM_LLM_BASE_URL:-https://api.deepseek.com/v1}
+      - ECOM_LLM_MODEL=${ECOM_LLM_MODEL:-deepseek-chat}
+      - ECOM_VLLM_BASE_URL=http://vllm:8000/v1
+      - ECOM_VLLM_MODEL=${ECOM_VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      - ECOM_VLLM_API_KEY=EMPTY
+      - ECOM_CORS_ORIGINS=${ECOM_CORS_ORIGINS:-http://localhost:3000,http://localhost:8080}
       - ECOM_REDIS_URL=redis://redis:6379/0
       - ECOM_MILVUS_HOST=milvus
-      - ECOM_DATABASE_URL=sqlite:///./ecommerce.db
+      - ECOM_DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-ecommerce}:${POSTGRES_PASSWORD:?must set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ecommerce}
+      - ECOM_NEO4J_URI=bolt://neo4j:7687
+      - ECOM_NEO4J_USER=${NEO4J_USER:-neo4j}
+      - ECOM_NEO4J_PASSWORD=${NEO4J_PASSWORD:?must set NEO4J_PASSWORD}
+      - ECOM_NEO4J_DATABASE=neo4j
+      - ECOM_PROFILE_SOURCE=kg
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      vllm:
+        condition: service_started
     restart: unless-stopped
 
   # Redis - Feature Store
@@ -28,6 +43,11 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # Milvus - Vector Database (standalone mode)
   milvus:
@@ -42,19 +62,80 @@ services:
       - milvus_data:/var/lib/milvus
     restart: unless-stopped
 
-  # MySQL - Business Data
-  mysql:
-    image: mysql:8.0
+  # PostgreSQL - Business Data
+  postgres:
+    image: postgres:16-alpine
     ports:
-      - "3306:3306"
+      - "5432:5432"
     environment:
-      - MYSQL_ROOT_PASSWORD=ecommerce123
-      - MYSQL_DATABASE=ecommerce
+      - POSTGRES_USER=${POSTGRES_USER:-ecommerce}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?must set POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-ecommerce}
     volumes:
-      - mysql_data:/var/lib/mysql
+      - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ecommerce} -d ${POSTGRES_DB:-ecommerce}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Neo4j - Knowledge Graph
+  neo4j:
+    image: neo4j:5.22-community
+    ports:
+      - "7474:7474"   # HTTP / Browser UI
+      - "7687:7687"   # Bolt driver port
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:?must set NEO4J_PASSWORD}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+      - NEO4J_dbms_memory_pagecache_size=512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  # vLLM - Local LLM Inference Server (OpenAI-compatible API, requires NVIDIA GPU)
+  vllm:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >-
+      --model ${ECOM_VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      --dtype auto
+      --max-model-len 4096
+      --api-key EMPTY
+      --served-model-name ${ECOM_VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
 
 volumes:
   redis_data:
   milvus_data:
-  mysql_data:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
+  hf_cache:

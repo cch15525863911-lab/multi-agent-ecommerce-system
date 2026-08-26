@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>架构重构对比文档 — Agent → Service 迁移</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2230;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --cyan: #39c5cf;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 0;
+  }
+  .container { max-width: 1200px; margin: 0 auto; padding: 48px 32px; }
+
+  /* Header */
+  .header {
+    text-align: center;
+    padding: 64px 32px 48px;
+    background: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #1a1f2e 100%);
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 {
+    font-size: 2.4rem;
+    font-weight: 800;
+    margin-bottom: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .header .subtitle { color: var(--text-dim); font-size: 1.1rem; margin-bottom: 24px; }
+  .header .meta {
+    display: flex; justify-content: center; gap: 24px; flex-wrap: wrap;
+    font-size: 0.85rem; color: var(--text-dim);
+  }
+  .header .meta span { display: inline-flex; align-items: center; gap: 6px; }
+  .header .meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+
+  /* Section */
+  .section { margin-bottom: 56px; }
+  .section-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 8px;
+    padding-bottom: 12px;
+    border-bottom: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .section-title .icon { font-size: 1.3rem; }
+  .section-desc { color: var(--text-dim); margin-bottom: 24px; font-size: 0.95rem; }
+
+  /* Cards */
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 20px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    transition: border-color 0.2s;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card h3 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card .tag {
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+  .tag-llm { background: rgba(88,166,255,0.15); color: var(--accent); border: 1px solid rgba(88,166,255,0.3); }
+  .tag-service { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+  .tag-base { background: rgba(188,140,255,0.15); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
+  .card p { color: var(--text-dim); font-size: 0.9rem; }
+  .card ul { list-style: none; margin-top: 12px; }
+  .card ul li {
+    font-size: 0.88rem;
+    color: var(--text-dim);
+    padding: 4px 0;
+    padding-left: 20px;
+    position: relative;
+  }
+  .card ul li::before { content: "▸"; position: absolute; left: 0; color: var(--accent); }
+
+  /* Architecture Diagram */
+  .arch-diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    overflow-x: auto;
+  }
+  .arch-flow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    min-width: 700px;
+  }
+  .arch-box {
+    border: 2px solid;
+    border-radius: 10px;
+    padding: 10px 20px;
+    text-align: center;
+    font-weight: 600;
+    font-size: 0.9rem;
+    min-width: 160px;
+  }
+  .arch-box.entry { border-color: var(--accent); color: var(--accent); }
+  .arch-box.llm { border-color: var(--accent); color: var(--accent); background: rgba(88,166,255,0.05); }
+  .arch-box.service { border-color: var(--green); color: var(--green); background: rgba(63,185,80,0.05); }
+  .arch-box.meta { border-color: var(--purple); color: var(--purple); background: rgba(188,140,255,0.05); }
+  .arch-box.exit { border-color: var(--text-dim); color: var(--text-dim); }
+  .arch-arrow {
+    width: 2px; height: 20px; background: var(--border);
+    position: relative;
+  }
+  .arch-arrow::after {
+    content: ""; position: absolute; bottom: -6px; left: -4px;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid var(--border);
+  }
+  .arch-branches {
+    display: flex; gap: 12px; align-items: flex-start;
+  }
+  .arch-branch-col {
+    display: flex; flex-direction: column; align-items: center; gap: 0;
+  }
+  .arch-label {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin: 4px 0;
+  }
+  .arch-fan-line {
+    width: 100%; height: 2px; background: var(--border);
+    position: relative;
+  }
+
+  /* Migration Table */
+  .migration-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+    font-size: 0.88rem;
+  }
+  .migration-table th {
+    background: var(--surface2);
+    padding: 12px 16px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-dim);
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+  }
+  .migration-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .migration-table tr:hover td { background: rgba(88,166,255,0.03); }
+  .migration-table .old-name { color: var(--red); }
+  .migration-table .new-name { color: var(--green); }
+  .migration-table .arrow-cell { color: var(--text-dim); text-align: center; }
+  .badge {
+    display: inline-block;
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 8px;
+    font-weight: 600;
+  }
+  .badge-removed { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge-migrated { background: rgba(210,153,34,0.15); color: var(--orange); }
+  .badge-retained { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-new { background: rgba(188,140,255,0.15); color: var(--purple); }
+
+  /* Comparison Box */
+  .compare-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+  .compare-col { padding: 24px; }
+  .compare-col.before { background: rgba(248,81,73,0.04); border-right: 1px solid var(--border); }
+  .compare-col.after { background: rgba(63,185,80,0.04); }
+  .compare-col h4 {
+    font-size: 1rem;
+    font-weight: 700;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .compare-col.before h4 { color: var(--red); }
+  .compare-col.after h4 { color: var(--green); }
+  .compare-col ul { list-style: none; }
+  .compare-col ul li {
+    padding: 6px 0 6px 22px;
+    position: relative;
+    font-size: 0.88rem;
+    color: var(--text-dim);
+  }
+  .compare-col.before ul li::before { content: "✗"; position: absolute; left: 0; color: var(--red); font-weight: bold; }
+  .compare-col.after ul li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: bold; }
+
+  /* Code Block */
+  .code-block {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    overflow-x: auto;
+    margin: 12px 0;
+  }
+  .code-block pre {
+    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: var(--text);
+  }
+  .code-block .comment { color: var(--text-dim); }
+  .code-block .keyword { color: var(--purple); }
+  .code-block .string { color: var(--green); }
+  .code-block .class-name { color: var(--accent); }
+
+  /* Protection Layer Comparison */
+  .protection-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+  }
+  .protection-table th {
+    background: var(--surface2);
+    padding: 10px 14px;
+    text-align: center;
+    font-weight: 600;
+    color: var(--text-dim);
+    border-bottom: 2px solid var(--border);
+  }
+  .protection-table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    text-align: center;
+  }
+  .protection-table td:first-child { text-align: left; font-weight: 600; }
+  .protection-table .yes { color: var(--green); font-weight: bold; }
+  .protection-table .no { color: var(--red); font-weight: bold; }
+  .protection-table .diff { color: var(--orange); font-weight: bold; }
+
+  /* Stats */
+  .stats-row {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 32px;
+    flex-wrap: wrap;
+  }
+  .stat-card {
+    flex: 1;
+    min-width: 180px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+  }
+  .stat-card .num {
+    font-size: 2.2rem;
+    font-weight: 800;
+    line-height: 1.2;
+  }
+  .stat-card .label { font-size: 0.82rem; color: var(--text-dim); margin-top: 4px; }
+  .stat-card.llm .num { color: var(--accent); }
+  .stat-card.service .num { color: var(--green); }
+  .stat-card.test .num { color: var(--purple); }
+  .stat-card.test-pass .num { color: var(--green); }
+
+  /* Tree */
+  .file-tree {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    font-family: "JetBrains Mono", "Consolas", monospace;
+    font-size: 0.85rem;
+    line-height: 1.8;
+  }
+  .file-tree .dir { color: var(--accent); font-weight: 600; }
+  .file-tree .file-removed { color: var(--red); text-decoration: line-through; }
+  .file-tree .file-added { color: var(--green); }
+  .file-tree .file-kept { color: var(--text); }
+  .file-tree .file-modified { color: var(--orange); }
+
+  /* Callout */
+  .callout {
+    background: rgba(88,166,255,0.05);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    padding: 16px 20px;
+    margin: 16px 0;
+    font-size: 0.9rem;
+  }
+  .callout strong { color: var(--accent); }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    padding: 32px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 0.82rem;
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <h1>架构重构对比文档</h1>
+  <p class="subtitle">Agent → Service 迁移：LLM 与传统业务系统职责分离</p>
+  <div class="meta">
+    <span><span class="dot"></span> 137/137 测试通过</span>
+    <span>重构日期: 2026-08-24</span>
+    <span>项目: multi-agent-ecommerce-system</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Stats -->
+  <div class="stats-row">
+    <div class="stat-card llm">
+      <div class="num">3</div>
+      <div class="label">保留 LLM Agent</div>
+    </div>
+    <div class="stat-card service">
+      <div class="num">7</div>
+      <div class="label">新建传统 Service</div>
+    </div>
+    <div class="stat-card test">
+      <div class="num">4</div>
+      <div class="label">删除旧 Agent</div>
+    </div>
+    <div class="stat-card test-pass">
+      <div class="num">137</div>
+      <div class="label">测试全部通过</div>
+    </div>
+  </div>
+
+  <!-- Section 1: 重构动机 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">1</span> 重构动机与核心原则</h2>
+    <p class="section-desc">明确 LLM 与传统系统的职责边界，消除面试中"LLM 设计过度"的质疑</p>
+
+    <div class="callout">
+      <strong>核心原则：</strong>LLM 负责语义理解 / 创意生成 / 灰度仲裁，传统系统负责确定性计算 / 低延迟任务 / 可审计逻辑。
+    </div>
+
+    <div class="compare-grid">
+      <div class="compare-col before">
+        <h4>重构前：8 个 Agent 混用</h4>
+        <ul>
+          <li>所有模块都继承 BaseAgent，无论是否使用 LLM</li>
+          <li>FraudDetectionAgent 内部虽有确定性规则引擎，但被包装为 Agent</li>
+          <li>CreditAssessmentAgent 使用评分卡，本质是确定性计算，却走 Agent 四层防护</li>
+          <li>SupplyChainAgent 的 Saga 事务编排被包在 Agent 框架内，增加了不必要的 LLM ReAct 复杂度</li>
+          <li>KGUserProfileAgent 的分群逻辑是规则引擎，却被命名为 Agent</li>
+          <li>面试时难以解释"为什么确定性逻辑要叫 Agent"</li>
+          <li>LLM ReAct 链路降级为"探索性功能"后仍占据主链路代码位置</li>
+        </ul>
+      </div>
+      <div class="compare-col after">
+        <h4>重构后：3 Agent + 7 Service</h4>
+        <ul>
+          <li>只有真正调用 LLM 的模块才叫 Agent（ProductRecAgent, MarketingCopyAgent, MetaAgent）</li>
+          <li>确定性逻辑全部迁移到 Service 层，继承 BaseProtectedService</li>
+          <li>Service 保留熔断 + 超时 + 降级三层防护（去掉重试层，业务操作多为非幂等）</li>
+          <li>Agent 保留完整四层防护（重试 + 超时 + 降级 + 熔断），因为 LLM 调用可能瞬时抖动</li>
+          <li>职责边界清晰：面试时可明确回答"哪些用 LLM，哪些不用"</li>
+          <li>编排层（graph.py / dynamic_engine.py）统一调用 Service.run() 和 Agent.run()</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 2: 架构拓扑对比 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">2</span> 架构拓扑对比</h2>
+    <p class="section-desc">重构前后的系统调用链路对比</p>
+
+    <h3 style="color:var(--red); margin-bottom:16px; font-size:1.05rem;">重构前 — 8 Agent 混合架构</h3>
+    <div class="arch-diagram">
+      <div class="arch-flow">
+        <div class="arch-box entry">START</div>
+        <div class="arch-arrow"></div>
+        <div class="arch-box service" style="border-color:var(--orange);color:var(--orange);">IntentRouter</div>
+        <div class="arch-arrow"></div>
+        <div class="arch-branches">
+          <div class="arch-branch-col">
+            <div class="arch-label">推荐链路</div>
+            <div class="arch-box llm">KGUserProfileAgent</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm">ProductRecAgent (LLM)</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm">InventoryAgent</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm">MarketingCopyAgent (LLM)</div>
+          </div>
+          <div class="arch-branch-col">
+            <div class="arch-label">风控链路</div>
+            <div class="arch-box llm" style="border-color:var(--red);color:var(--red);">FraudDetectionAgent</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm" style="border-color:var(--red);color:var(--red);">CreditAssessmentAgent</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm" style="border-color:var(--red);color:var(--red);">RefundRiskAgent</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm" style="border-color:var(--red);color:var(--red);">SupplyChainAgent</div>
+          </div>
+        </div>
+        <div class="arch-arrow"></div>
+        <div class="arch-box meta" style="border-color:var(--orange);color:var(--orange);">MetaAgent (内部类)</div>
+        <div class="arch-arrow"></div>
+        <div class="arch-box exit">END</div>
+      </div>
+    </div>
+    <p style="color:var(--text-dim);font-size:0.82rem;margin-top:8px;text-align:center;">
+      所有 8 个模块都继承 BaseAgent，即使 5 个从未调用 LLM。MetaAgent 是 dynamic_engine.py 的内部类。
+    </p>
+
+    <h3 style="color:var(--green); margin:32px 0 16px; font-size:1.05rem;">重构后 — 3 LLM Agent + 7 Service 分层架构</h3>
+    <div class="arch-diagram">
+      <div class="arch-flow">
+        <div class="arch-box entry">START</div>
+        <div class="arch-arrow"></div>
+        <div class="arch-box service">IntentRouter (规则优先, LLM 兜底)</div>
+        <div class="arch-arrow"></div>
+        <div class="arch-branches">
+          <div class="arch-branch-col">
+            <div class="arch-label">推荐链路</div>
+            <div class="arch-box service">ProfileService</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm">ProductRecAgent (LLM 重排)</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box service">InventoryService</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box llm">MarketingCopyAgent (LLM 文案)</div>
+          </div>
+          <div class="arch-branch-col">
+            <div class="arch-label">风控链路</div>
+            <div class="arch-box service">FraudService</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box service">CreditService</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box service">RefundRiskService</div>
+            <div class="arch-arrow"></div>
+            <div class="arch-box service">FulfillmentService</div>
+          </div>
+        </div>
+        <div class="arch-arrow"></div>
+        <div class="arch-box meta">MetaAgent (独立 LLM Agent)</div>
+        <div class="arch-arrow"></div>
+        <div class="arch-box exit">END</div>
+      </div>
+    </div>
+    <p style="color:var(--text-dim);font-size:0.82rem;margin-top:8px;text-align:center;">
+      3 个蓝色 LLM Agent 负责语义/创意/仲裁，6 个绿色 Service 负责确定性计算。MetaAgent 提升为独立 Agent。
+    </p>
+  </div>
+
+  <!-- Section 3: 迁移明细表 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">3</span> 模块迁移明细表</h2>
+    <p class="section-desc">每个模块的迁移前后的类名、继承关系、核心变化</p>
+
+    <table class="migration-table">
+      <thead>
+        <tr>
+          <th>模块职责</th>
+          <th>重构前 (Agent)</th>
+          <th>重构后 (Service / Agent)</th>
+          <th>状态</th>
+          <th>核心变化</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>反欺诈检测</td>
+          <td class="old-name">FraudDetectionAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">FraudService<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseProtectedService</span></td>
+          <td><span class="badge badge-migrated">迁移</span></td>
+          <td>去掉 LLM ReAct 链路，确定性规则引擎成为唯一主链路；max_retries 从 2 降为 1（非幂等操作）</td>
+        </tr>
+        <tr>
+          <td>信用授信评估</td>
+          <td class="old-name">CreditAssessmentAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">CreditService<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseProtectedService</span></td>
+          <td><span class="badge badge-migrated">迁移</span></td>
+          <td>去掉 LLM ReAct 链路，评分卡成为唯一决策路径；降级时返回拒绝结果（保守策略）</td>
+        </tr>
+        <tr>
+          <td>退款风控</td>
+          <td class="old-name">RefundRiskAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">RefundRiskService<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseProtectedService</span></td>
+          <td><span class="badge badge-migrated">迁移</span></td>
+          <td>去掉 LLM ReAct 链路，规则引擎成为唯一主链路；降级时返回人工审核</td>
+        </tr>
+        <tr>
+          <td>供应链履约</td>
+          <td class="old-name">SupplyChainAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">FulfillmentService<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseProtectedService</span></td>
+          <td><span class="badge badge-migrated">迁移</span></td>
+          <td>Saga 事务编排从 Agent 内部提取为独立 Service；execute() 直接调用 run_fulfillment_saga()，保留审计日志</td>
+        </tr>
+        <tr>
+          <td>用户画像</td>
+          <td class="old-name">KGUserProfileAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">ProfileService<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseProtectedService</span></td>
+          <td><span class="badge badge-migrated">迁移</span></td>
+          <td>去掉 LLM 分群推断，改用 RFM 确定性规则；保留 Neo4j 知识图谱查询；10-20x 更快，100% 可复现</td>
+        </tr>
+        <tr>
+          <td>库存校验</td>
+          <td class="old-name">InventoryAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">InventoryService<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseProtectedService</span></td>
+          <td><span class="badge badge-migrated">迁移</span></td>
+          <td>从 Agent 迁移为 Service；保留安全库存预警和限购策略；max_retries=1</td>
+        </tr>
+        <tr>
+          <td>商品推荐 (重排)</td>
+          <td class="new-name">ProductRecAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">ProductRecAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td><span class="badge badge-retained">保留</span></td>
+          <td>不变 — LLM 语义重排 + 召回层（协同过滤 + Milvus 向量检索）</td>
+        </tr>
+        <tr>
+          <td>营销文案</td>
+          <td class="new-name">MarketingCopyAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td class="new-name">MarketingCopyAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">extends BaseAgent</span></td>
+          <td><span class="badge badge-retained">保留</span></td>
+          <td>不变 — LLM 文案生成 + 合规校验（敏感词过滤 + 广告法检查）</td>
+        </tr>
+        <tr>
+          <td>跨域仲裁</td>
+          <td class="old-name">MetaAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">dynamic_engine.py 内部类</span></td>
+          <td class="new-name">MetaAgent<br><span style="font-size:0.78rem;color:var(--text-dim)">agents/meta_agent.py 独立模块</span></td>
+          <td><span class="badge badge-new">提升</span></td>
+          <td>从 dynamic_engine.py 内部类提取为独立 LLM Agent；规则快通道 + LLM 仲裁灰度双路径</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Section 4: 基类对比 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">4</span> 基类设计对比</h2>
+    <p class="section-desc">BaseAgent (四层防护) vs BaseProtectedService (三层防护) 的差异</p>
+
+    <table class="protection-table">
+      <thead>
+        <tr>
+          <th>防护层</th>
+          <th>BaseAgent (LLM Agent)</th>
+          <th>BaseProtectedService (传统 Service)</th>
+          <th>差异说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>L1 重试</td>
+          <td class="yes">✓ 指数退避 2 次</td>
+          <td class="diff">✓ 指数退避 1 次</td>
+          <td>Service 减少重试次数 — 业务操作多为非幂等（扣减库存、创建订单），重复执行可能导致重复扣减</td>
+        </tr>
+        <tr>
+          <td>L2 超时</td>
+          <td class="yes">✓ asyncio.wait_for</td>
+          <td class="yes">✓ asyncio.wait_for</td>
+          <td>相同 — 独立超时控制防止长尾阻塞</td>
+        </tr>
+        <tr>
+          <td>L3 降级</td>
+          <td class="yes">✓ _fallback()</td>
+          <td class="yes">✓ _fallback()</td>
+          <td>相同 — 失败时返回降级结果，保证链路不中断</td>
+        </tr>
+        <tr>
+          <td>L4 熔断</td>
+          <td class="yes">✓ CircuitBreaker</td>
+          <td class="yes">✓ CircuitBreaker</td>
+          <td>相同 — 滑动窗口错误率监控，OPEN 时直接降级</td>
+        </tr>
+        <tr>
+          <td>抽象方法</td>
+          <td>_execute()</td>
+          <td>execute()</td>
+          <td>命名差异：Agent 用 protected _execute，Service 用 public execute</td>
+        </tr>
+        <tr>
+          <td>LLM 依赖</td>
+          <td class="yes">✓ get_llm() / ReAct</td>
+          <td class="no">✗ 无 LLM</td>
+          <td>Service 不调用 LLM，不使用 ReAct 工具选择，纯确定性逻辑</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="code-block">
+<pre><span class="comment"># BaseAgent — LLM Agent 基类 (四层防护)</span>
+<span class="keyword">class</span> <span class="class-name">BaseAgent</span>(ABC):
+    <span class="keyword">async def</span> run(self, **kwargs) -> AgentResult:
+        <span class="comment"># L4: 熔断检查 → L1: 重试(2次) + L2: 超时 → _execute()</span>
+        ...
+    <span class="keyword">async def</span> <span class="keyword">_execute</span>(self, **kwargs) -> AgentResult:  <span class="comment"># 子类实现 LLM 逻辑</span>
+        ...
+
+<span class="comment"># BaseProtectedService — 传统 Service 基类 (三层防护)</span>
+<span class="keyword">class</span> <span class="class-name">BaseProtectedService</span>(ABC):
+    <span class="keyword">async def</span> run(self, **kwargs) -> AgentResult:
+        <span class="comment"># L4: 熔断检查 → L1: 重试(1次) + L2: 超时 → execute()</span>
+        ...
+    <span class="keyword">async def</span> execute(self, **kwargs) -> AgentResult:   <span class="comment"># 子类实现确定性逻辑</span>
+        ...</pre>
+    </div>
+  </div>
+
+  <!-- Section 5: 文件变更清单 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">5</span> 文件变更清单</h2>
+    <p class="section-desc">新增、修改、删除的文件一览</p>
+
+    <div class="file-tree">
+<span class="dir">python/</span>
+├── <span class="dir">agents/</span>
+│   ├── __init__.py                        <span class="file-modified">[修改] 仅导出 3 个 LLM Agent</span>
+│   ├── base_agent.py                      <span class="file-kept">[保留] LLM Agent 基类</span>
+│   ├── meta_agent.py                      <span class="file-added">[新增] 从 dynamic_engine 提取的独立 LLM Agent</span>
+│   ├── product_rec_agent.py               <span class="file-kept">[保留] LLM 语义重排</span>
+│   ├── marketing_copy_agent.py            <span class="file-kept">[保留] LLM 文案生成</span>
+│   ├── fraud_agent.py                     <span class="file-removed">[删除] → fraud_service.py</span>
+│   ├── credit_agent.py                    <span class="file-removed">[删除] → credit_service.py</span>
+│   ├── refund_risk_agent.py               <span class="file-removed">[删除] → refund_service.py</span>
+│   └── supply_chain_agent.py             <span class="file-removed">[删除] → fulfillment_service.py</span>
+│
+├── <span class="dir">services/</span>
+│   ├── __init__.py                        <span class="file-modified">[修改] 导出 7 个 Service</span>
+│   ├── base_service.py                    <span class="file-added">[新增] BaseProtectedService 基类</span>
+│   ├── fraud_service.py                   <span class="file-added">[新增] FraudService (规则引擎)</span>
+│   ├── credit_service.py                  <span class="file-added">[新增] CreditService (评分卡)</span>
+│   ├── refund_service.py                  <span class="file-added">[新增] RefundRiskService (规则引擎)</span>
+│   ├── inventory_service.py               <span class="file-added">[新增] InventoryService (库存校验)</span>
+│   ├── fulfillment_service.py             <span class="file-added">[新增] FulfillmentService (Saga 编排)</span>
+│   └── profile_service.py                <span class="file-added">[新增] ProfileService (用户画像)</span>
+│
+├── <span class="dir">orchestrator/</span>
+│   ├── graph.py                           <span class="file-modified">[修改] Agent→Service 替换</span>
+│   └── dynamic_engine.py                 <span class="file-modified">[修改] 5 领域分支改用 Service</span>
+│
+├── <span class="dir">tests/</span>
+│   ├── pytest.ini                         <span class="file-added">[新增] asyncio_mode = auto</span>
+│   ├── test_graph_topology.py            <span class="file-modified">[修改] 属性名 user_profile_agent → profile_service</span>
+│   ├── test_benchmark.py                 <span class="file-modified">[修改] Agent → Service 引用</span>
+│   ├── test_kg_profile.py                <span class="file-modified">[修改] Agent → Service 引用</span>
+│   ├── test_supply_chain.py              <span class="file-modified">[修改] Agent → Service 引用</span>
+│   └── test_intent_and_meta.py           <span class="file-modified">[修改] Agent → Service 引用</span>
+    </div>
+  </div>
+
+  <!-- Section 6: 编排层变化 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">6</span> 编排层核心变化</h2>
+    <p class="section-desc">graph.py 和 dynamic_engine.py 中的关键修改</p>
+
+    <h3 style="font-size:1.05rem; margin-bottom:12px;">6.1 推荐链路 (graph.py)</h3>
+    <div class="compare-grid">
+      <div class="compare-col before">
+        <h4>重构前</h4>
+        <ul>
+          <li>profile_service = KGUserProfileAgent(kg_store=kg_store)</li>
+          <li>inventory_agent = InventoryAgent()</li>
+          <li>user_profile_node 调用 user_profile_agent.run()</li>
+          <li>inventory_node 调用 inventory_agent.run()</li>
+          <li>所有节点统一用 Agent 接口</li>
+        </ul>
+      </div>
+      <div class="compare-col after">
+        <h4>重构后</h4>
+        <ul>
+          <li>profile_service = ProfileService(kg_store=kg_store)</li>
+          <li>inventory_service = InventoryService()</li>
+          <li>user_profile_node 调用 profile_service.run()</li>
+          <li>inventory_node 调用 inventory_service.run()</li>
+          <li>LLM Agent (ProductRecAgent, MarketingCopyAgent) 保持不变</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3 style="font-size:1.05rem; margin:24px 0 12px;">6.2 动态引擎 (dynamic_engine.py)</h3>
+    <div class="compare-grid">
+      <div class="compare-col before">
+        <h4>重构前</h4>
+        <ul>
+          <li>class MetaAgent 定义在 dynamic_engine.py 内部</li>
+          <li>_init_components() 初始化 8 个 Agent</li>
+          <li>fraud_branch 调用 FraudDetectionAgent.run()</li>
+          <li>credit_branch 调用 CreditAssessmentAgent.run()</li>
+          <li>refund_branch 调用 RefundRiskAgent.run()</li>
+          <li>fulfillment_branch 调用 SupplyChainAgent.run()</li>
+        </ul>
+      </div>
+      <div class="compare-col after">
+        <h4>重构后</h4>
+        <ul>
+          <li>from agents import MetaAgent (独立模块导入)</li>
+          <li>_init_components() 初始化 3 Agent + 6 Service</li>
+          <li>fraud_branch 调用 FraudService.run()</li>
+          <li>credit_branch 调用 CreditService.run()</li>
+          <li>refund_branch 调用 RefundRiskService.run()</li>
+          <li>fulfillment_branch 调用 FulfillmentService.run()</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 7: 各 Service 详细说明 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">7</span> 新建 Service 详细说明</h2>
+    <p class="section-desc">每个 Service 的核心逻辑、降级策略、与旧 Agent 的差异</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h3>FraudService <span class="tag tag-service">Service</span></h3>
+        <p>反欺诈规则引擎 — 确定性检测，亚毫秒级响应</p>
+        <ul>
+          <li><strong>主链路:</strong> risk_tools.check_fraud() — IP/设备黑名单 + 行为规则 + 历史欺诈</li>
+          <li><strong>降级策略:</strong> 返回 HIGH 风险 + needs_human_review=True（保守策略）</li>
+          <li><strong>与旧 Agent 差异:</strong> 去掉 LLM ReAct 链路和 MCP 工具选择，规则引擎成为唯一路径</li>
+          <li><strong>超时:</strong> 8s | <strong>重试:</strong> 1 次</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>CreditService <span class="tag tag-service">Service</span></h3>
+        <p>信用评分引擎 — 确定性评分卡，可审计可解释</p>
+        <ul>
+          <li><strong>主链路:</strong> risk_tools.assess_credit() — 信用档案查询 + 额度评估 + 利率计算</li>
+          <li><strong>降级策略:</strong> 返回 approved=False, credit_score=0（拒绝授信）</li>
+          <li><strong>与旧 Agent 差异:</strong> 去掉 LLM ReAct，评分卡 100% 可复现</li>
+          <li><strong>超时:</strong> 8s | <strong>重试:</strong> 1 次</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>RefundRiskService <span class="tag tag-service">Service</span></h3>
+        <p>退款风控规则引擎 — 确定性检测，分级处理</p>
+        <ul>
+          <li><strong>主链路:</strong> risk_tools.assess_refund_risk() — 频率/金额/历史/理由规则</li>
+          <li><strong>降级策略:</strong> 返回 MANUAL_REVIEW + HIGH 风险（人工介入）</li>
+          <li><strong>与旧 Agent 差异:</strong> 去掉 LLM ReAct，规则引擎直接判定</li>
+          <li><strong>超时:</strong> 8s | <strong>重试:</strong> 1 次</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>FulfillmentService <span class="tag tag-service">Service</span></h3>
+        <p>供应链履约 Saga 编排 — 确定性事务 + 四层防护补偿</p>
+        <ul>
+          <li><strong>主链路:</strong> run_fulfillment_saga() — 库存校验→预占→物流匹配→订单创建</li>
+          <li><strong>降级策略:</strong> 返回 success=False + 错误信息</li>
+          <li><strong>与旧 Agent 差异:</strong> Saga 编排从 Agent 内提取为独立 Service，每步有独立熔断器</li>
+          <li><strong>超时:</strong> 12s | <strong>重试:</strong> 1 次</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>ProfileService <span class="tag tag-service">Service</span></h3>
+        <p>用户画像 — Neo4j 图谱特征 + 确定性规则分群</p>
+        <ul>
+          <li><strong>主链路:</strong> KGStore.get_profile_features() + RFM 规则分群</li>
+          <li><strong>降级策略:</strong> 返回 NEW_USER 默认画像</li>
+          <li><strong>与旧 Agent 差异:</strong> 去掉 LLM 分群推断，10-20x 更快，100% 可复现</li>
+          <li><strong>超时:</strong> 可配置 | <strong>重试:</strong> 2 次（读操作幂等）</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>InventoryService <span class="tag tag-service">Service</span></h3>
+        <p>库存查询与预警 — 确定性库存校验</p>
+        <ul>
+          <li><strong>主链路:</strong> 遍历商品检查库存 + 安全库存预警 + 限购策略</li>
+          <li><strong>降级策略:</strong> 返回空可用列表（安全优先）</li>
+          <li><strong>与旧 Agent 差异:</strong> 从 Agent 迁移为 Service，逻辑不变</li>
+          <li><strong>超时:</strong> 可配置 | <strong>重试:</strong> 1 次</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 8: 保留的 LLM Agent -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">8</span> 保留的 3 个 LLM Agent</h2>
+    <p class="section-desc">每个 Agent 为何保留 LLM — 明确的 LLM 价值点</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h3>ProductRecAgent <span class="tag tag-llm">LLM Agent</span></h3>
+        <p>商品推荐 — LLM 语义重排</p>
+        <ul>
+          <li><strong>LLM 用途:</strong> 语义级商品排序（理解用户意图 vs 机械匹配）</li>
+          <li><strong>召回层:</strong> 协同过滤 + Milvus 向量检索 + 热度策略（确定性，无 LLM）</li>
+          <li><strong>重排层:</strong> LLM 结合用户画像 + 知识图谱上下文做语义重排</li>
+          <li><strong>为何不能改为 Service:</strong> "看了手机壳→可能在找配件而非新手机"需要语义推理</li>
+          <li><strong>LLM 模型:</strong> DeepSeek-V3 (deepseek-chat)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>MarketingCopyAgent <span class="tag tag-llm">LLM Agent</span></h3>
+        <p>营销文案 — LLM 创意生成</p>
+        <ul>
+          <li><strong>LLM 用途:</strong> 个性化营销文案生成（创意表达）</li>
+          <li><strong>模板系统:</strong> 按用户分群（新客/老客/高价值/价格敏感/流失风险）选择 Prompt</li>
+          <li><strong>合规校验:</strong> 敏感词过滤 + 广告法检查（确定性规则）</li>
+          <li><strong>为何不能改为 Service:</strong> 文案创作本质是创意生成，无法用规则穷举</li>
+          <li><strong>LLM 模型:</strong> DeepSeek-V3 (deepseek-chat)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>MetaAgent <span class="tag tag-llm">LLM Agent</span></h3>
+        <p>跨域仲裁 — LLM 灰度决策</p>
+        <ul>
+          <li><strong>LLM 用途:</strong> 灰度区间（30≤risk<100）的模糊决策 + 跨域信号冲突仲裁</li>
+          <li><strong>规则快通道:</strong> risk≥100 直接拒绝，risk<30 直接通过（确定性，<1ms）</li>
+          <li><strong>灰度通道:</strong> LLM 综合各 Service 结果权衡后决策</li>
+          <li><strong>降级:</strong> LLM 不可用时回退规则引擎</li>
+          <li><strong>为何不能改为 Service:</strong> 灰度区间需要综合判断，规则无法覆盖所有组合</li>
+          <li><strong>LLM 模型:</strong> DeepSeek-R1 (deepseek-reasoner)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 9: 测试验证 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">9</span> 测试验证结果</h2>
+    <p class="section-desc">137 个测试全部通过，0 回归</p>
+
+    <div class="card-grid">
+      <div class="card">
+        <h3>测试统计</h3>
+        <ul>
+          <li>总测试数: 137</li>
+          <li>通过: 137</li>
+          <li>失败: 0</li>
+          <li>执行时间: 24.24s</li>
+          <li>asyncio 模式: auto (pytest.ini)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>关键修复</h3>
+        <ul>
+          <li>新增 pytest.ini 配置 asyncio_mode=auto，解决 52 个异步测试失败</li>
+          <li>修复 test_graph_topology.py 中 user_profile_agent → profile_service 属性名</li>
+          <li>修复 test_graph_topology.py 中 inventory_agent → inventory_service 属性名</li>
+          <li>更新 test_benchmark.py 引用 FraudService/CreditService 等新 Service</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>性能基准</h3>
+        <ul>
+          <li>风控检测（规则引擎）: ~0.7ms</li>
+          <li>信用评估（评分卡）: ~0.5ms</li>
+          <li>退款风控（规则引擎）: ~0.6ms</li>
+          <li>履约 Saga（4步事务）: ~2ms</li>
+          <li>MetaAgent 规则快通道: <1ms</li>
+          <li>LLM 链路: 1-3s（取决于 LLM 服务响应）</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- Section 10: 设计决策总结 -->
+  <div class="section">
+    <h2 class="section-title"><span class="icon">10</span> 关键设计决策</h2>
+    <p class="section-desc">重构中的核心权衡和选择</p>
+
+    <div class="callout">
+      <strong>决策 1 — 为什么 Service 去掉重试层？</strong><br>
+      业务操作（扣减库存、创建订单、预占库存）多为非幂等操作，重试可能导致重复扣减。保留 max_retries=1 仅用于网络瞬时抖动，Agent 保留 max_retries=2 因为 LLM 调用更可能瞬时失败且幂等。
+    </div>
+    <div class="callout">
+      <strong>决策 2 — 为什么 MetaAgent 提升为独立 Agent？</strong><br>
+      原来是 dynamic_engine.py 的内部类，职责不清晰。提取为 agents/meta_agent.py 后：(1) 明确它是 3 个 LLM Agent 之一；(2) 规则快通道 + LLM 仲裁双路径更清晰；(3) 独立测试更方便。
+    </div>
+    <div class="callout">
+      <strong>决策 3 — 为什么 ProfileService 保留 max_retries=2？</strong><br>
+      用户画像是读操作（Neo4j 查询 + Redis 读取），幂等可安全重试。其他 Service 操作多为写操作（扣减、创建、预占），降为 1 次。
+    </div>
+    <div class="callout">
+      <strong>决策 4 — 为什么 IntentRouter 用规则优先 + LLM 兜底？</strong><br>
+      意图路由是高频低延迟操作，关键词规则匹配 <1ms 即可覆盖 90% 场景。LLM 兜底仅用于关键词无法匹配的边缘情况，可通过配置 intent_router_use_llm 开关控制。
+    </div>
+  </div>
+
+</div>
+
+<div class="footer">
+  <p>multi-agent-ecommerce-system | 架构重构对比文档 | 2026-08-24</p>
+</div>
+
+</body>
+</html>

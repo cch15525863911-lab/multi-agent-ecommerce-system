@@ -1,7 +1,7 @@
 """
 营销文案Agent
 - Prompt模板引擎：基于用户画像动态选择模板(新客/老客/高价值)
-- 个性化生成：调用MiniMax M2.7生成文案
+- 个性化生成：调用LLM(cloud API 或 vLLM)生成文案
 - 合规校验：敏感词过滤 + 广告法合规检查
 """
 
@@ -12,9 +12,9 @@ import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import get_settings
+from llm import get_model_router
 from models.schemas import (
     MarketingCopyResult,
     Product,
@@ -64,17 +64,14 @@ class MarketingCopyAgent(BaseAgent):
             name="marketing_copy",
             timeout=settings.agent_timeout_marketing_copy,
         )
-        self.llm = ChatOpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            temperature=0.9,
-            max_tokens=2048,
+        self.llm = get_model_router().create_llm(
+            task_type="marketing_copy", temperature=0.9, max_tokens=2048
         )
 
     async def _execute(self, **kwargs: Any) -> MarketingCopyResult:
         user_profile: UserProfile | None = kwargs.get("user_profile")
         products: list[Product] = kwargs.get("products", [])
+        graph_context: str = kwargs.get("graph_context", "")
 
         if not products:
             return MarketingCopyResult(success=True, copies=[], confidence=1.0)
@@ -86,10 +83,13 @@ class MarketingCopyAgent(BaseAgent):
             f"- ID:{p.product_id} 名称:{p.name} 类目:{p.category} 价格:¥{p.price} 标签:{','.join(p.tags)}"
             for p in products
         )
+        human_message = f"商品列表:\n{product_info}"
+        if graph_context:
+            human_message += f"\n\n知识图谱上下文:\n{graph_context}"
 
         messages = [
             SystemMessage(content=system_prompt + COPY_OUTPUT_INSTRUCTION),
-            HumanMessage(content=f"商品列表:\n{product_info}"),
+            HumanMessage(content=human_message),
         ]
         response = await self.llm.ainvoke(messages)
 

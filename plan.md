@@ -3,10 +3,10 @@ name: 多Agent电商推荐系统
 overview: 构建一个面向面试的企业级多Agent电商推荐与营销系统项目，包含Java/Go/Python三语言实现、配套八股文、简历模板和面试STAR法指南，从零到面试全流程覆盖。
 todos:
   - id: phase1-python-core
-    content: "Phase 1: Python核心骨架 - LangGraph + Supervisor + 4 Agent + MiniMax M2.7接入"
+    content: "Phase 1: Python核心骨架 - LangGraph + Supervisor + 4 Agent + LLM接入(cloud API / vLLM)"
     status: completed
   - id: phase2-feature-storage
-    content: "Phase 2: 实时特征工程(Redis) + 向量检索(Milvus) + 业务数据(MySQL/SQLite)"
+    content: "Phase 2: 实时特征工程(Redis) + 向量检索(Milvus) + 业务数据(PostgreSQL)"
     status: completed
   - id: phase3-ab-testing
     content: "Phase 3: A/B测试引擎 + MAB动态调优 + 监控面板"
@@ -39,7 +39,7 @@ isProject: false
 
 - **Spring AI Alibaba Multi-Agent Demo** (`spring-ai-alibaba/spring-ai-alibaba-multi-agent-demo`)
   - Java企业级，Supervisor + 3子Agent（咨询/订单/反馈）
-  - 技术栈：Spring AI Alibaba + MySQL + Redis + Nacos + MCP协议
+  - 技术栈：Spring AI Alibaba + PostgreSQL + Redis + Nacos + MCP协议
   - 亮点：将Multi-Agent开发从5天压缩到5小时
 
 - **京东商家智能助手**（非开源，但有技术博客）
@@ -84,8 +84,8 @@ graph TB
     
     UserProfile --> FeatureStore["实时特征库(Redis)"]
     ProductRec --> VectorDB["向量数据库(Milvus)"]
-    MarketCopy --> LLM["LLM(MiniMax M2.7)"]
-    InventoryDec --> WMS["库存系统(MySQL)"]
+    MarketCopy --> LLM["LLM(vLLM / cloud API)"]
+    InventoryDec --> WMS["库存系统(PostgreSQL)"]
 ```
 
 ### 2.2 四大Agent详细设计
@@ -123,8 +123,8 @@ graph TB
 ### 3.1 Python版（推荐入门，代码量最少）
 
 - **框架**：LangGraph + LangChain
-- **LLM**：MiniMax M2.7（通过OpenAI兼容接口）
-- **存储**：Redis（特征）+ Milvus（向量）+ SQLite（业务数据）
+- **LLM**：支持 cloud API(DeepSeek/MiniMax等) / vLLM 本地推理（均通过OpenAI兼容接口，环境变量切换）
+- **存储**：Redis（特征）+ Milvus（向量）+ PostgreSQL（业务数据）
 - **Web**：FastAPI
 - **核心文件结构**：
   - `agents/user_profile_agent.py` - 用户画像Agent
@@ -139,7 +139,7 @@ graph TB
 
 - **框架**：Spring AI Alibaba + Spring Boot 3
 - **LLM**：MiniMax M2.7
-- **存储**：Redis + Milvus + MySQL
+- **存储**：Redis + Milvus + PostgreSQL
 - **核心模块**：
   - `agent/` - 四个Agent实现（Spring AI Alibaba Agentic API）
   - `orchestrator/` - Supervisor编排（Tool Calling模式）
@@ -206,10 +206,15 @@ graph TB
 - Handoffs：去中心化，Agent间直接传递控制权，适合对话场景
 
 **Q3: 如何保证Agent调用的稳定性？**
-- 重试机制：指数退避 + 最大重试次数
-- 超时控制：每个Agent设置独立超时
-- 降级策略：Agent失败时返回默认结果
-- 熔断器：连续失败时自动熔断
+- 四层防护（BaseAgent.run 封装）：
+  1. 重试(L1)：tenacity 指数退避(500ms→1s→2s)，最多2次
+  2. 独立超时(L2)：asyncio.wait_for 每次尝试独立计时
+  3. 降级(L3)：返回 fallback 结果，保证链路不中断
+  4. 熔断(L4)：滑动窗口错误率≥50%→OPEN，30s后HALF_OPEN探测
+- 四层防护已集成到 Saga 事务编排：execute/compensate 独立熔断器
+  · SagaStep._protected_execute / _protected_compensate 分别包装四层
+  · 业务失败(return False)不触发熔断，仅基础设施异常触发
+  · 审计轨迹记录 execute_circuit / compensate_circuit 状态
 
 **Q4: 实时特征怎么做的？**
 - Redis Sorted Set存储用户行为序列（score=时间戳）
@@ -266,7 +271,7 @@ multi-agent-ecommerce/
 │   ├── agent/
 │   ├── orchestrator/
 │   └── handler/
-└── docker-compose.yml        # 一键启动（Redis+Milvus+MySQL）
+└── docker-compose.yml        # 一键启动（Redis+Milvus+PostgreSQL）
 ```
 
 ---
@@ -278,13 +283,13 @@ multi-agent-ecommerce/
 **Phase 1 - 核心骨架（Python版）**
 - Supervisor + 4 Agent基础框架
 - LangGraph状态图编排
-- MiniMax M2.7接入
+- LLM接入(支持 cloud API / vLLM 本地推理)
 - 基本的并行调用 + 结果聚合
 
 **Phase 2 - 特征与存储**
 - Redis实时特征工程
 - Milvus向量检索
-- MySQL业务数据
+- PostgreSQL业务数据
 
 **Phase 3 - A/B测试与监控**
 - 流量分桶引擎

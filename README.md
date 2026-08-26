@@ -44,7 +44,7 @@
 
 ### 技术关键词（面试常考）
 
-`Multi-Agent` · `Supervisor模式` · `LangGraph` · `asyncio并行` · `Redis Feature Store` · `A/B Testing` · `Thompson Sampling` · `RAG` · `ReAct` · `MiniMax LLM`
+`Multi-Agent` · `Supervisor模式` · `LangGraph 拓扑图(fan-out/fan-in)` · `Saga 事务补偿` · `四层防护(重试/超时/降级/熔断)` · `Redis Feature Store` · `Neo4j Knowledge Graph` · `GraphRAG` · `图算法` · `A/B Testing` · `Thompson Sampling` · `RAG` · `ReAct` · `vLLM 本地推理`
 
 ---
 
@@ -68,7 +68,7 @@
 │  │   用户画像 Agent      │    │   商品召回 Agent      │            │
 │  │  user_profile_agent  │    │  product_rec_agent   │            │
 │  │  ──────────────────  │    │  ────────────────── │            │
-│  │  Redis → 实时行为特征 │    │  协同过滤+向量检索召回 │            │
+│  │  Neo4j → 图谱特征     │    │  协同过滤+向量检索召回 │            │
 │  │  RFM模型 → 用户分群   │    │  返回候选商品列表     │            │
 │  └──────────┬───────────┘    └──────────┬──────────┘            │
 │             │                           │                         │
@@ -77,7 +77,7 @@
 │  │   LLM重排 Agent      │    │   库存决策 Agent      │            │
 │  │  (product_rec再次调用)│    │   inventory_agent    │            │
 │  │  ──────────────────  │    │  ────────────────── │            │
-│  │  用户画像 × 商品属性  │    │  MySQL → 实时库存查询 │            │
+│  │  用户画像 × 商品属性  │    │ PostgreSQL → 实时库存查询│            │
 │  │  LLM精排，返回TopN   │    │  过滤缺货，输出限购策略│            │
 │  └──────────┬───────────┘    └──────────┬──────────┘            │
 │             │                           │                         │
@@ -136,7 +136,7 @@ Supervisor 模式                     Handoffs 模式
 
 ### Agent 1：用户画像 Agent
 
-**文件**：[`python/agents/user_profile_agent.py`](python/agents/user_profile_agent.py)
+**文件**：[`python/agents/kg_user_profile_agent.py`](python/agents/kg_user_profile_agent.py)（默认 KG 版）；[`python/agents/user_profile_agent.py`](python/agents/user_profile_agent.py)（Redis + LLM 旧版）
 
 **它做什么？**
 
@@ -159,9 +159,12 @@ return UserProfile(user_id=user_id, segments=["active"], rfm_score=...)
 ```
 
 **关键技术**：
+- **Neo4j 知识图谱**：`User -> Product` 的浏览/购买/收藏边，聚合类目偏好、价格区间、活跃时段和 RFM，分群规则可解释且不需要 LLM
 - **Redis Sorted Set**：`ZADD user:u001:clicks {时间戳} {商品ID}`，支持滑动窗口查询
 - **RFM 模型**：Recency（最近购买时间）× Frequency（购买频率）× Monetary（消费金额）
 - **用户分群**：新客 / VIP / 价格敏感 / 活跃 / 流失风险，共 5 类
+
+默认通过 `ECOM_PROFILE_SOURCE=kg` 使用 KG 画像；需要回退旧链路时改为 `redis`。
 
 ---
 
@@ -176,6 +179,7 @@ return UserProfile(user_id=user_id, segments=["active"], rfm_score=...)
 ```
 多路召回策略
   ├── 协同过滤（买了A也买了B）
+  ├── 知识图谱关系+多跳召回（RELATED_TO）
   ├── 向量检索（Milvus，语义相似商品）
   ├── 热度策略（最近7天热卖）
   └── 新品策略（上架30天内）
@@ -188,6 +192,8 @@ return UserProfile(user_id=user_id, segments=["active"], rfm_score=...)
         ▼
   TopN 商品列表（交给库存 Agent 过滤）
 ```
+
+图谱相关能力已接入：商品之间存在 `RELATED_TO`（搭配购买/互补/替代）关系，支持多跳候选、Jaccard 相似用户、度中心性热点商品，并把图谱路径作为 GraphRAG 上下文注入 LLM 重排和文案生成。
 
 ---
 
@@ -225,7 +231,7 @@ BANNED_WORDS = ["最好", "第一", "最便宜", "绝对", "100%"]
 
 ```python
 # 输入: 推荐商品列表 [P001, P002, P003, ...]
-# 查询 MySQL/WMS 实时库存
+# 查询 PostgreSQL/WMS 实时库存
 # 输出:
 {
     "available_products": ["P001", "P003"],   # 有货商品
@@ -341,46 +347,150 @@ class ABTestEngine:
 
 ---
 
-### Agent 基类：重试 + 降级（可靠性保障）
+### Agent 基类：重试/超时/降级/熔断 四层防护（可靠性保障）
 
-**文件**：[`python/agents/base_agent.py`](python/agents/base_agent.py)
+**文件**：[`python/agents/base_agent.py`](python/agents/base_agent.py) · [`python/services/circuit_breaker.py`](python/services/circuit_breaker.py)
+
+```
+执行流程:
+    run() → [L4: 熔断检查] → [L1: 重试 + L2: 超时] → _execute()
+                ↓ OPEN              ↓ 失败
+            [L3: 降级]         [L4: 记录失败] → [L3: 降级]
+                                    ↓ 成功
+                              [L4: 记录成功] → 返回结果
+```
+
+| 层 | 名称 | 机制 | 防护目标 |
+|----|------|------|----------|
+| L1 | 重试 | tenacity 指数退避 (500ms→1s→2s, 最多2次) | 瞬时抖动 |
+| L2 | 独立超时 | asyncio.wait_for 每次尝试独立计时 | 长尾阻塞 |
+| L3 | 降级 | 返回 fallback 结果, 保证链路不中断 | 全链路可用 |
+| L4 | 熔断 | 滑动窗口错误率≥50% → OPEN, 30s 后 HALF_OPEN 探测 | 连锁故障 |
 
 ```python
 class BaseAgent(ABC):
-    """所有 Agent 的基类 — 模板方法模式"""
-    
-    MAX_RETRIES = 3
-    RETRY_DELAY = 1.0  # 秒，指数退避
+    """所有 Agent 的基类 — 四层防护 + 模板方法模式"""
 
     async def run(self, **kwargs) -> AgentResult:
-        """公开方法：封装了计时、重试、降级"""
+        """公开方法：四层防护按序生效"""
         start = time.perf_counter()
+
+        # Layer 4: 熔断器 OPEN 时直接降级, 不调用 _execute
+        if not self._circuit.allow_request():
+            return self._fallback(latency_ms, CircuitOpenError(self.name))
+
         try:
-            return await self._retry_execute(**kwargs)
-        except Exception as e:
-            # 全部重试失败 → 降级（返回默认结果，不影响其他 Agent）
-            logger.warning(f"{self.name} fallback triggered: {e}")
-            return self._fallback(**kwargs)
+            # Layer 1 (重试) + Layer 2 (独立超时) 在 _retry_execute 内
+            result = await self._retry_execute(**kwargs)
+            self._circuit.record_success()      # L4: 记录成功
+            return result
+        except Exception as exc:
+            self._circuit.record_failure()      # L4: 记录失败
+            return self._fallback(latency_ms, exc)  # L3: 降级
 
     async def _retry_execute(self, **kwargs) -> AgentResult:
-        """指数退避重试"""
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                return await asyncio.wait_for(
-                    self._execute(**kwargs),
-                    timeout=self.timeout,  # 每个 Agent 独立超时控制
-                )
-            except asyncio.TimeoutError:
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RETRY_DELAY * (2 ** attempt))  # 1s, 2s, 4s
-        raise RuntimeError(f"{self.name} failed after {self.MAX_RETRIES} retries")
+        """Layer 1: tenacity 指数退避 + Layer 2: 每次尝试独立超时"""
+
+        @retry(stop=stop_after_attempt(self.max_retries + 1),
+               wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+               reraise=True)
+        async def _single_attempt() -> AgentResult:
+            return await asyncio.wait_for(       # L2: 独立超时
+                self._execute(**kwargs),
+                timeout=self.timeout,
+            )
+
+        return await _single_attempt()
 
     @abstractmethod
     async def _execute(self, **kwargs) -> AgentResult:
         """子类只需实现这个方法，写业务逻辑即可"""
 ```
 
-> 💡 **小白解读**：就像打电话打不通会重拨，第1次立刻重拨，第2次等2秒，第3次等4秒（指数退避）。如果全失败了，就返回一个"说得过去的默认结果"（降级），保证整个系统不崩溃。
+熔断器三态有限状态机：
+
+```
+CLOSED  --(错误率≥阈值)-->  OPEN  --(超过恢复时间)-->  HALF_OPEN
+  ↑                                                        │
+  └─────────── (探测成功) ─────────────────────────────────┘
+HALF_OPEN ──(探测失败)──>  OPEN (重新熔断)
+```
+
+> 💡 **小白解读**：四层防护就像家里的保险体系——重试是"断网了刷新一下"，超时是"等3秒还不来就不等了"，降级是"实在不行用备用方案"，熔断是"连续出问题就先别调了，等30秒再试试"。四层叠加，保证一个 Agent 出问题不会拖垮整个系统。
+
+---
+
+### Saga 事务编排与补偿机制（最终一致性 + 四层防护）
+
+**文件**：[`python/services/saga.py`](python/services/saga.py) · [`python/tests/test_saga_circuit.py`](python/tests/test_saga_circuit.py)
+
+履约链路（库存校验 → 分布式预占 → 物流匹配 → 订单创建）跨多个服务，
+任一步骤失败都需要回滚已执行的操作。采用 **Orchestration-based Saga** 模式保障最终一致性。
+
+**每个步骤的 execute 和 compensate 均接入四层防护**, 确保补偿机制也具备熔断能力：
+
+```
+SagaOrchestrator.execute()
+    │
+    ├── step._protected_execute(ctx)
+    │       ├── [L4] execute 熔断检查 → OPEN → 跳过(CIRCUIT_OPEN)
+    │       ├── [L1] tenacity 重试(500ms→1s→2s)
+    │       ├── [L2] asyncio.wait_for 独立超时(5-8s)
+    │       └── execute() → 成功: record_success / 异常: record_failure
+    │
+    └── (失败时) step._protected_compensate(ctx)  ← 逆序执行
+            ├── [L4] compensate 熔断检查 → OPEN → 跳过(COMPENSATE_FAILED)
+            ├── [L1] tenacity 重试
+            ├── [L2] asyncio.wait_for 独立超时
+            └── compensate() → 成功: record_success / 异常: record_failure
+```
+
+| 步骤 | 超时 | Execute (正向执行) | Compensate (补偿回滚) |
+|------|------|-------------------|----------------------|
+| CheckInventory | 5s | 查询多仓库存, 选可用最多的仓 | 无 (只读操作) |
+| ReserveInventory | 5s | Redis SETNX 分布式预占 | `release_inventory` 归还库存 |
+| MatchLogistics | 5s | 物流路线匹配 + 高价值加密保价 | 无 (无副作用) |
+| CreateOrder | 8s | 订单创建 + PostgreSQL 落库 | `cancel_order` 取消订单 + 释放预占 |
+
+**execute 与 compensate 独立熔断**：每个步骤持有两个独立的 CircuitBreaker
+(`_execute_circuit` / `_compensate_circuit`)，互不影响。execute 连续失败不会
+阻断 compensate，反之亦然。
+
+```python
+# SagaStep 基类 — 四层防护集成
+class SagaStep(ABC):
+    def __init__(self):
+        self._execute_circuit = CircuitBreaker(...)    # execute 专用熔断器
+        self._compensate_circuit = CircuitBreaker(...)  # compensate 专用熔断器
+
+    async def _protected_execute(self, ctx):
+        # L4: 熔断检查 → OPEN 时直接返回 False (CIRCUIT_OPEN)
+        if not self._execute_circuit.allow_request():
+            return False, f"circuit_open:{self.name}.execute"
+        try:
+            # L1(重试) + L2(超时) → execute()
+            success = await self._retry_call(self.execute, ctx)
+            if success:
+                self._execute_circuit.record_success()
+            return success, None      # 业务失败(False)不触发熔断
+        except Exception as exc:
+            self._execute_circuit.record_failure()  # 基础设施异常触发熔断
+            return False, str(exc)
+
+    async def _protected_compensate(self, ctx):
+        # 同样的四层防护, 独立熔断器
+        if not self._compensate_circuit.allow_request():
+            return False, f"circuit_open:{self.name}.compensate"
+        try:
+            await self._retry_call(self.compensate, ctx)
+            self._compensate_circuit.record_success()
+            return True, None
+        except Exception as exc:
+            self._compensate_circuit.record_failure()
+            return False, str(exc)
+```
+
+> 💡 **小白解读**：就像网购下单流程——先锁定库存，再匹配物流，最后创建订单。如果创建订单失败，系统会自动"倒带"：取消订单、释放库存。但补偿操作本身也可能失败（比如数据库挂了），所以补偿也加了四层防护：重试几次、超时控制、补偿失败记录下来、连续补偿失败就熔断不试了。execute 和 compensate 有独立的熔断器，就像家里的总闸和电器各自的保险丝，一个跳了不影响另一个。
 
 ---
 
@@ -417,7 +527,9 @@ func (s *Supervisor) Recommend(ctx context.Context, req *model.RecommendRequest)
 ### 前置条件
 
 - Python 3.11+ / Java 17+ / Go 1.22+（选一个语言即可）
-- 申请 LLM API Key（推荐 [MiniMax](https://www.minimax.chat/) 或 [阿里通义](https://dashscope.aliyun.com/)，有免费额度）
+- LLM 后端二选一：
+  - **云端 API**：申请 [MiniMax](https://www.minimax.chat/) 或 [阿里通义](https://dashscope.aliyun.com/) API Key（有免费额度）
+  - **本地 vLLM**：需要 NVIDIA GPU（≥16GB 显存），无需 API Key，数据不出本地
 
 ---
 
@@ -435,9 +547,11 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 # 3. 安装依赖
 pip install -r requirements.txt
 
-# 4. 配置 API Key
+# 4. 配置 LLM
 cp .env.example .env
-# 用记事本/VS Code 打开 .env，填入你的 LLM_API_KEY
+# 编辑 .env:
+#   方式一(云端 API): 设置 ECOM_LLM_PROVIDER=cloud, 填入 ECOM_LLM_API_KEY
+#   方式二(本地 vLLM): 设置 ECOM_LLM_PROVIDER=vllm, 启动 vLLM 容器 (见下方 Docker 部署)
 
 # 5. 启动服务
 python main.py
@@ -498,20 +612,62 @@ curl -X POST http://localhost:8080/api/v1/recommend \
 
 ---
 
-### Docker 一键部署（含 Redis + MySQL 等依赖）
+### Docker 一键部署（含 Redis + PostgreSQL + vLLM 等依赖）
 
 ```bash
-# 在项目根目录运行
+# 在项目根目录运行（含全部依赖）
 docker-compose up -d
 
-# 等待所有服务启动（约30秒）
+# 仅启动核心依赖（不含 vLLM，使用云端 LLM API）
+docker-compose up -d redis milvus postgres neo4j
+
+# 等待所有服务启动（约30秒，vLLM 首次加载模型需3-5分钟）
 docker-compose ps
 
 # 服务地址
 # Python API:  http://localhost:8000
 # Java API:    http://localhost:8080
 # Redis:       localhost:6379
-# MySQL:       localhost:3306
+# PostgreSQL:  localhost:5432
+# Neo4j:       http://localhost:7474
+# vLLM:        http://localhost:8001  (需要 NVIDIA GPU)
+```
+
+#### LLM Provider 切换
+
+系统支持两种 LLM 后端，通过环境变量 `ECOM_LLM_PROVIDER` 切换：
+
+| Provider | 说明 | 适用场景 |
+|----------|------|----------|
+| `cloud` (默认) | 云端 OpenAI 兼容 API (DeepSeek / MiniMax / OpenAI 等) | 开发调试、无 GPU 环境 |
+| `vllm` | 本地 vLLM 推理服务 (Qwen2.5-7B-Instruct) | 生产部署、数据隐私、低延迟 |
+
+```bash
+# 使用云端 LLM（默认）
+export ECOM_LLM_PROVIDER=cloud
+export ECOM_LLM_API_KEY=your_api_key
+export ECOM_LLM_MODEL=MiniMax-M1
+
+# 切换到本地 vLLM（需先启动 vLLM 容器）
+export ECOM_LLM_PROVIDER=vllm
+# vLLM 配置自动从 ECOM_VLLM_* 读取
+
+# 查看当前 LLM 状态
+curl http://localhost:8000/api/v1/llm/status
+```
+
+灌入演示用户和商品行为（可选）：
+
+```bash
+cd python
+python scripts/seed_kg.py
+```
+
+初始化 PostgreSQL 业务数据库（建表 + 仓库/库存种子数据）：
+
+```bash
+cd python
+python -m database.init_db
 ```
 
 ---
@@ -526,6 +682,7 @@ docker-compose ps
 | `POST` | `/api/v1/recommend/graph` | LangGraph 状态图推荐 | Python only |
 | `GET` | `/api/v1/experiments` | 查看 A/B 实验状态 | Python / Java |
 | `GET` | `/api/v1/metrics` | 系统监控指标 | Python only |
+| `GET` | `/api/v1/llm/status` | LLM provider 状态 (cloud / vLLM) | Python only |
 | `GET` | `/health` | 健康检查 | 全部 |
 
 ### 请求示例
@@ -601,21 +758,41 @@ multi-agent-ecommerce-system/
 │   ├── requirements.txt               # 依赖列表
 │   ├── .env.example                   # 环境变量模板
 │   ├── agents/                        # 4 个 Agent 实现
-│   │   ├── base_agent.py              # 基类：重试/超时/降级
-│   │   ├── user_profile_agent.py      # 用户画像 Agent
+│   │   ├── base_agent.py              # 基类：重试/超时/降级/熔断 四层防护
+│   │   ├── user_profile_agent.py      # 用户画像 Agent (Redis + LLM)
+│   │   ├── kg_user_profile_agent.py   # 用户画像 Agent (Neo4j 知识图谱)
 │   │   ├── product_rec_agent.py       # 商品推荐 Agent
 │   │   ├── marketing_copy_agent.py    # 营销文案 Agent
-│   │   └── inventory_agent.py         # 库存决策 Agent
+│   │   ├── inventory_agent.py         # 库存决策 Agent
+│   │   └── supply_chain_agent.py      # 供应链履约 Agent (MCP + ReAct)
+│   ├── llm/                           # LLM 工厂 (cloud / vLLM 切换)
+│   │   └── factory.py                 # get_llm() 统一创建 LLM 客户端
+│   ├── database/                      # PostgreSQL 业务数据库
+│   │   ├── engine.py                  # SQLAlchemy 引擎 + 会话工厂
+│   │   ├── models.py                  # ORM 模型 (仓库/库存/订单等)
+│   │   └── init_db.py                 # 建表 + 种子数据脚本
 │   ├── orchestrator/
 │   │   ├── supervisor.py              # ⭐ Supervisor 并行编排（核心）
-│   │   └── graph.py                   # LangGraph 状态图
+│   │   └── graph.py                   # ⭐ LangGraph 三阶段拓扑图 (fan-out/fan-in)
 │   ├── services/
 │   │   ├── ab_test.py                 # A/B 测试引擎（Thompson Sampling）
 │   │   ├── feature_store.py           # Redis 实时特征服务
+│   │   ├── fulfillment_tools.py       # 履约业务工具 (库存/预占/物流/订单/补偿)
+│   │   ├── saga.py                    # ⭐ Saga 事务编排 + 补偿机制
+│   │   ├── circuit_breaker.py         # ⭐ 熔断器 (CLOSED/OPEN/HALF_OPEN 三态)
+│   │   ├── mcp_fulfillment_server.py   # MCP Server (工具封装)
+│   │   ├── kg_store.py                # Neo4j 知识图谱存储
+│   │   ├── graph_rag.py              # GraphRAG 上下文构建
 │   │   └── metrics.py                 # Prometheus 监控指标
 │   ├── models/schemas.py              # Pydantic 数据模型
 │   ├── config/settings.py             # 配置管理
 │   └── tests/                         # 单元测试
+│       ├── test_supply_chain.py      # 履约链路测试
+│       ├── test_saga.py              # Saga 事务补偿测试
+│       ├── test_circuit_breaker.py   # 四层防护测试 (9个用例)
+│       ├── test_saga_circuit.py      # Saga 四层防护集成测试 (8个用例)
+│       ├── test_graph_topology.py    # LangGraph 拓扑图测试 (8个用例)
+│       └── test_ab_test.py            # A/B 测试引擎测试
 │
 ├── java/                              # ☕ Java 实现（企业级 Spring 生态）
 │   ├── pom.xml                        # Maven 依赖（Spring AI Alibaba）
@@ -741,22 +918,27 @@ multi-agent-ecommerce-system/
 
 ### Q7：Agent 调用失败怎么处理？
 
-> 三层保障：
-> 1. **超时控制**：`asyncio.wait_for(coro, timeout=5)` — 每个 Agent 独立超时，不阻塞整体
-> 2. **指数退避重试**：失败后等 1s → 2s → 4s 重试，共 3 次
-> 3. **降级（Fallback）**：全部重试失败后，返回"说得过去的默认结果"（如热门商品列表），保证整个系统不崩溃
+> 四层防护（重试 / 独立超时 / 降级 / 熔断）：
+> 1. **重试**：tenacity 指数退避 (500ms→1s→2s)，最多2次，覆盖瞬时抖动
+> 2. **独立超时**：`asyncio.wait_for(coro, timeout)` — 每次尝试独立计时，防止长尾阻塞
+> 3. **降级（Fallback）**：全部重试失败后返回默认结果（如热门商品列表），保证链路不中断
+> 4. **熔断（Circuit Breaker）**：滑动窗口错误率≥50% → OPEN（直接降级），30s后 HALF_OPEN 探测，成功则恢复
 
 ---
 
 ### Q8：LangGraph 和直接写 `asyncio.gather()` 有什么区别？
 
-> | | LangGraph | 直接写 asyncio |
+> | | LangGraph 拓扑图 | 直接写 asyncio.gather |
 > |--|--|--|
-> | 状态管理 | 内置 State，节点间自动传递 | 手动管理变量 |
+> | 并行机制 | 原生 fan-out/fan-in 边: 一个节点多条出边→并行, 多入边→自动等待 join | 函数级: 手动 `gather(fn1(), fn2())` |
+> | 状态管理 | 内置 State + Annotated reducer 自动合并并行分支 | 手动管理变量, 并行结果需手动合并 |
 > | 持久化 | 内置 Checkpoint，支持断点续跑 | 需要自己实现 |
-> | 可视化 | 可以画出状态图 | 无 |
+> | 可视化 | `graph.get_graph().draw_mermaid()` 导出 DAG 图 | 无 |
 > | Human-in-the-loop | 内置支持，可以在节点暂停等人工确认 | 需要自己实现 |
-> | 适合场景 | 复杂、有分支的工作流 | 简单并行任务 |
+> | 适合场景 | 复杂 DAG 拓扑、多阶段并行+join | 简单两阶段并行 |
+>
+> 本项目两种都提供: `/api/v1/recommend` 走 Supervisor (asyncio.gather),
+> `/api/v1/recommend/graph` 走 LangGraph 三阶段拓扑图 (fan-out/fan-in)。
 
 ---
 
@@ -826,7 +1008,8 @@ multi-agent-ecommerce-system/
 | LangGraph 官方文档 | LangGraph 状态图框架 | [文档](https://langchain-ai.github.io/langgraph/) |
 | 京东商家智能助手技术博客 | 京东 Multi-Agent 生产实践 | [掘金](https://juejin.cn/post/7470344960563871784) |
 | DualAgent-Rec | 双 Agent 推荐系统 | [GitHub](https://github.com/GuilinDev/Dual-Agent-Recommendation) |
-| MiniMax API | 本项目默认 LLM 服务 | [官网](https://www.minimax.chat/) |
+| MiniMax API | 本项目云端 LLM 选项之一 | [官网](https://www.minimax.chat/) |
+| vLLM | 本地 LLM 推理引擎 (OpenAI 兼容) | [GitHub](https://github.com/vllm-project/vllm) |
 
 ---
 

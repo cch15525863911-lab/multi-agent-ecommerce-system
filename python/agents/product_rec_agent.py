@@ -11,31 +11,39 @@ import json
 import random
 from typing import Any
 
+import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from config import get_settings
-from models.schemas import AgentResult, Product, ProductRecResult, UserProfile
+from llm import get_model_router
+from models.schemas import Product, ProductRecResult, UserProfile
+from services.cf_store import CFStore
+from services.graph_rag import GraphRAGService
+from services.milvus_store import MilvusStore
 
 from .base_agent import BaseAgent
 
-RERANK_PROMPT = """你是电商推荐排序专家。根据用户画像和候选商品,重新排序并选出最优的{num_items}个商品。
+logger = structlog.get_logger()
+
+RERANK_PROMPT = """你是电商推荐排序专家。基于用户画像和知识图谱上下文,
+从候选商品中选出最符合用户当前意图的商品。
 
 用户画像:
 {user_profile}
 
+知识图谱上下文(用户关系/商品关联/多跳路径):
+{graph_context}
+
 候选商品:
 {candidates}
 
-排序原则:
-1. 用户偏好类目优先
-2. 价格在用户可接受范围内
-3. 保证类目多样性(相邻商品尽量不同类目)
-4. 新品适当加权
+重点考虑:
+1. 用户近期浏览/购买行为暗示的真实需求(如:看了手机壳→可能在找配件而非新手机)
+2. 知识图谱中的关联路径强度(如:共购关系、同品类偏好)
+3. 商品之间的组合价值(如:手机+充电器组合推荐优于两个手机)
 
 请输出商品ID列表(JSON数组),按推荐优先级排序:
 ["product_id_1", "product_id_2", ...]
-
 只输出JSON数组,不要其他内容。"""
 
 MOCK_PRODUCTS = [
@@ -58,27 +66,42 @@ MOCK_PRODUCTS = [
 
 
 class ProductRecAgent(BaseAgent):
-    def __init__(self):
+    def __init__(self, kg_store: Any | None = None):
         settings = get_settings()
         super().__init__(
             name="product_rec",
             timeout=settings.agent_timeout_product_rec,
         )
-        self.llm = ChatOpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            temperature=0.3,
-            max_tokens=512,
+        self.llm = get_model_router().create_llm(
+            task_type="recommendation_rerank", temperature=0.3, max_tokens=512
         )
-        self.vector_store: Any = None  # injected in Phase 2
+        self.vector_store = MilvusStore()
+        self.cf_store = CFStore()
+        self.kg_store = kg_store
+        self.graph_rag = GraphRAGService(kg_store)
+        self._seeded = False
 
     async def _execute(self, **kwargs: Any) -> ProductRecResult:
         user_profile: UserProfile | None = kwargs.get("user_profile")
         num_items: int = kwargs.get("num_items", 10)
+        user_id: str = kwargs.get("user_id") or (
+            user_profile.user_id if user_profile else ""
+        )
 
-        candidates = await self._recall(user_profile, num_items * 3)
-        ranked_ids = await self._rerank(user_profile, candidates, num_items)
+        candidates = await self._recall(user_profile, user_id, num_items * 3)
+        graph_context = await self.graph_rag.build_user_context(
+            user_id,
+            seed_product_ids=(
+                list(dict.fromkeys(
+                    (user_profile.recent_purchases or [])[:5]
+                    + (user_profile.recent_views or [])[:5]
+                ))
+                if user_profile else []
+            ),
+        )
+        ranked_ids = await self._rerank(
+            user_profile, candidates, num_items, graph_context
+        )
 
         id_to_product = {p.product_id: p for p in candidates}
         final_products = []
@@ -95,32 +118,206 @@ class ProductRecAgent(BaseAgent):
         return ProductRecResult(
             success=True,
             products=final_products[:num_items],
-            recall_strategy="collaborative_filter+vector+hot",
-            data={"candidate_count": len(candidates), "reranked": len(ranked_ids)},
+            recall_strategy="vector+collaborative+graph+hot",
+            data={
+                "candidate_count": len(candidates),
+                "scored_candidates": sum(1 for p in candidates if p.score > 0),
+                "reranked": len(ranked_ids),
+                "graph_context": graph_context,
+            },
             confidence=0.8,
         )
 
-    async def _recall(self, profile: UserProfile | None, limit: int) -> list[Product]:
-        """Multi-strategy recall: collaborative filtering + vector search + popularity."""
-        if self.vector_store:
-            pass  # Phase 2: real vector search
+    async def _ensure_seeded(self) -> None:
+        """Lazily seed MOCK_PRODUCTS into the vector store on first recall."""
+        if self._seeded:
+            return
+        await self.vector_store.upsert_products(MOCK_PRODUCTS)
+        self._seeded = True
 
-        candidates = list(MOCK_PRODUCTS)
+    @staticmethod
+    def _build_query_text(profile: UserProfile | None) -> str:
+        """Build a search query from user profile preferences."""
+        if not profile:
+            return ""
+        parts: list[str] = []
+        parts.extend(profile.preferred_categories or [])
+        # Expand recent view/purchase IDs into product text
+        mock_by_id = {p.product_id: p for p in MOCK_PRODUCTS}
+        for pid in (profile.recent_views or [])[:5]:
+            p = mock_by_id.get(pid)
+            if p:
+                parts.extend([p.name, p.category, p.brand])
+        return " ".join(p for p in parts if p)
+
+    async def _vector_recall(
+        self, profile: UserProfile | None, limit: int
+    ) -> list[Product]:
+        """Vector ANN recall via Milvus (falls back to in-memory cosine)."""
+        query_text = self._build_query_text(profile)
+        if not query_text:
+            return []
+        results = await self.vector_store.search_by_text(query_text, limit=limit)
+        return [self._to_product(row) for row in results]
+
+    async def _cf_recall(
+        self, user_id: str, limit: int
+    ) -> list[Product]:
+        """Collaborative filtering recall via Redis (falls back to in-memory)."""
+        if not user_id:
+            return []
+        cf_results = await self.cf_store.recommend(user_id, limit=limit)
+        if not cf_results:
+            return []
+        pid_to_cf_score = {r["product_id"]: r["cf_score"] for r in cf_results}
+        mock_by_id = {p.product_id: p for p in MOCK_PRODUCTS}
+        products = []
+        for pid, score in pid_to_cf_score.items():
+            base = mock_by_id.get(pid)
+            if base:
+                p = base.model_copy()
+                p.score = float(score)
+                products.append(p)
+        return products
+
+    async def _recall(
+        self, profile: UserProfile | None, user_id: str, limit: int
+    ) -> list[Product]:
+        """Multi-strategy recall: vector + collaborative + graph + popularity."""
+        await self._ensure_seeded()
+
+        # --- Vector recall (Milvus / in-memory fallback) ---
+        vector_candidates = await self._vector_recall(profile, limit)
+
+        # --- CF recall (Redis / in-memory fallback) ---
+        cf_candidates = await self._cf_recall(user_id, limit)
+
+        # --- Graph recall (Neo4j) ---
+        graph_rows = await self._graph_recall(profile, user_id, limit)
+        graph_candidates = [self._to_product(row) for row in graph_rows]
+
+        # --- Popularity fallback ---
+        popularity = list(MOCK_PRODUCTS)
+
+        # --- Merge & deduplicate ---
+        seen: set[str] = set()
+        candidates: list[Product] = []
+
+        for p in vector_candidates + cf_candidates + graph_candidates + popularity:
+            if p.product_id in seen:
+                continue
+            seen.add(p.product_id)
+            candidates.append(p)
+
+        # --- Score-based sort with diversity boost ---
         if profile and profile.preferred_categories:
             preferred = set(profile.preferred_categories)
             candidates.sort(
-                key=lambda p: (p.category in preferred, p.stock > 0, random.random()),
+                key=lambda p: (
+                    p.score,
+                    p.category in preferred,
+                    p.stock > 0,
+                    random.random(),
+                ),
+                reverse=True,
+            )
+        else:
+            candidates.sort(
+                key=lambda p: (p.score, p.stock > 0, random.random()),
                 reverse=True,
             )
 
         return candidates[:limit]
 
+    async def _graph_recall(
+        self, profile: UserProfile | None, user_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Collect KG candidates: related products, multi-hop, degree centrality."""
+        if self.kg_store is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        seed_ids: list[str] = []
+        if profile:
+            seed_ids = list(
+                dict.fromkeys(
+                    (profile.recent_purchases or [])[:5]
+                    + (profile.recent_views or [])[:5]
+                )
+            )
+        for seed_id in seed_ids:
+            rows.extend(
+                await self.kg_store.get_related_products(
+                    seed_id, limit=max(1, limit // 2)
+                )
+            )
+        if user_id:
+            rows.extend(
+                await self.kg_store.get_multi_hop_candidates(
+                    user_id, max_hops=2, limit=limit
+                )
+            )
+            rows.extend(
+                await self.kg_store.get_degree_central_products(
+                    limit=max(1, limit // 3)
+                )
+            )
+        return rows[: limit * 3]
+
+    def _score_candidates(
+        self, profile: UserProfile | None, candidates: list[Product]
+    ) -> list[Product]:
+        """确定性打分: 类目偏好 + 价格区间 + 多样性 + 商品热度"""
+        if not profile:
+            return candidates
+        scored: list[tuple[Product, float]] = []
+        seen_categories: set[str] = set()
+        preferred = set(profile.preferred_categories or [])
+        price_range = profile.price_range or (0, float("inf"))
+        for p in candidates:
+            score = p.score
+            if p.category in preferred:
+                score += 0.3
+            if price_range[0] <= p.price <= price_range[1]:
+                score += 0.2
+            if p.category not in seen_categories:
+                score += 0.1
+                seen_categories.add(p.category)
+            p_copy = p.model_copy()
+            p_copy.score = score
+            scored.append((p_copy, score))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [p for p, _ in scored]
+
     async def _rerank(
-        self, profile: UserProfile | None, candidates: list[Product], num_items: int
+        self,
+        profile: UserProfile | None,
+        candidates: list[Product],
+        num_items: int,
+        graph_context: str,
     ) -> list[str]:
         if not profile:
             return [p.product_id for p in candidates[:num_items]]
 
+        # 第一步: 确定性规则排序
+        scored = self._score_candidates(profile, candidates)
+
+        # 第二步: LLM 语义重排（仅对 top-N 候选，控制成本）
+        top_candidates = scored[:num_items * 2]
+        ranked_ids = await self._llm_rerank(profile, top_candidates, num_items, graph_context)
+
+        # 兜底: LLM 失败时回退到确定性排序
+        if not ranked_ids:
+            return [p.product_id for p in top_candidates[:num_items]]
+        return ranked_ids
+
+    async def _llm_rerank(
+        self,
+        profile: UserProfile | None,
+        candidates: list[Product],
+        num_items: int,
+        graph_context: str,
+    ) -> list[str]:
+        """LLM 语义重排: 理解用户意图 + 知识图谱关联路径"""
         profile_summary = {
             "segments": [s.value for s in profile.segments],
             "preferred_categories": profile.preferred_categories,
@@ -133,6 +330,7 @@ class ProductRecAgent(BaseAgent):
         prompt = RERANK_PROMPT.format(
             num_items=num_items,
             user_profile=json.dumps(profile_summary, ensure_ascii=False),
+            graph_context=graph_context or "暂无",
             candidates=json.dumps(candidate_summary, ensure_ascii=False),
         )
         messages = [
@@ -146,4 +344,20 @@ class ProductRecAgent(BaseAgent):
                 raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
             return json.loads(raw)
         except (json.JSONDecodeError, IndexError):
-            return [p.product_id for p in candidates[:num_items]]
+            return []
+
+    @staticmethod
+    def _to_product(row: dict[str, Any]) -> Product:
+        return Product(
+            product_id=row["product_id"],
+            name=row.get("name") or "",
+            category=row.get("category") or "",
+            price=float(row.get("price") or 0),
+            description=row.get("description") or "",
+            brand=row.get("brand") or "",
+            seller_id=row.get("seller_id") or "",
+            stock=int(row.get("stock") or 0),
+            tags=list(row.get("tags") or []),
+            score=float(row.get("graph_score") or 0),
+            image_url=row.get("image_url") or "",
+        )

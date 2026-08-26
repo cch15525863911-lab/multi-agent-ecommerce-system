@@ -27,13 +27,28 @@ class FeatureStore:
     # ---------- behavior tracking ----------
 
     async def record_behavior(
-        self, user_id: str, behavior_type: str, item_id: str, metadata: dict | None = None
+        self, user_id: str, behavior_type: str, item_id: str,
+        amount: float = 0.0, metadata: dict | None = None,
     ):
-        """Append a behavior event to user's sorted set (score = timestamp)."""
+        """Append a behavior event to user's sorted set (score = timestamp).
+
+        Args:
+            user_id: User identifier.
+            behavior_type: One of "view", "click", "purchase", etc.
+            item_id: Product / item identifier.
+            amount: Transaction amount (for purchases). Used by RFM monetary scoring.
+            metadata: Extra fields merged into the event payload.
+        """
         if not self.redis:
+            logger.warning("feature_store.redis_missing", user_id=user_id, behavior=behavior_type)
             return
         key = f"behavior:{user_id}:{behavior_type}"
-        payload = json.dumps({"item_id": item_id, "ts": time.time(), **(metadata or {})})
+        payload = json.dumps({
+            "item_id": item_id,
+            "ts": time.time(),
+            "amount": amount,
+            **(metadata or {}),
+        })
         await self.redis.zadd(key, {payload: time.time()})
         await self.redis.expire(key, self.ttl)
 
@@ -97,7 +112,7 @@ class FeatureStore:
 
         recency = max(0.0, 1.0 - days_since / 30.0)
         frequency = min(1.0, len(purchases) / 10.0)
-        avg_amount = sum(p.get("amount", 100) for p in purchases) / len(purchases)
+        avg_amount = sum(p.get("amount", 0.0) for p in purchases) / len(purchases)
         monetary = min(1.0, avg_amount / 1000.0)
 
         return {

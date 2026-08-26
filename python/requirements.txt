@@ -6,7 +6,9 @@ fastapi>=0.115.0
 uvicorn>=0.34.0
 redis>=5.2.0
 pymilvus>=2.5.0
+sentence-transformers>=3.0.0
 sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
 pydantic>=2.10.0
 pydantic-settings>=2.7.0
 httpx>=0.28.0
@@ -15,3 +17,7 @@ python-dotenv>=1.0.0
 tenacity>=9.0.0
 structlog>=24.4.0
 prometheus-client>=0.21.0
+neo4j>=5.20.0
+# MCP: supply-chain agent loads fulfillment tools over the MCP protocol
+mcp>=1.2.0
+langchain-mcp-adapters>=0.1.0
