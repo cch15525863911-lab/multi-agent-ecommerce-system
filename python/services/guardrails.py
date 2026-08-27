@@ -246,7 +246,9 @@ class JWTAuth:
     def __init__(self, enabled: bool = False):  # 默认关闭, 避免影响现有接口
         self.enabled = enabled
         settings = get_settings()
-        self.secret = getattr(settings, "jwt_secret", "dev-secret-change-in-production")
+        # 密钥只从配置读取, 不提供任何硬编码 fallback (防止"未配置时静默使用公开已知密钥")。
+        # 开启鉴权且密钥缺失/过弱时, 由 main.py 启动期 fail-fast 统一拦截。
+        self.secret: str | None = settings.jwt_secret
         self.algorithm = "HS256"
 
     def _generate_token(self, user_id: str, scopes: list[str] | None = None) -> str:
@@ -280,6 +282,11 @@ class JWTAuth:
         """
         if not self.enabled:
             return True, {"sub": "anonymous", "scopes": ["read", "write"]}
+
+        # 密钥未配置时直接拒绝 (fail-closed), 避免 None.encode() 崩溃
+        if not self.secret:
+            logger.warning("guardrails.jwt_secret_missing")
+            return False, {}
 
         try:
             import hmac

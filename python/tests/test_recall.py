@@ -124,7 +124,8 @@ async def test_recall_returns_products_without_profile() -> None:
     assert len(candidates) > 0, "should return popularity fallback products"
     assert len(candidates) <= 10
     pids = {p.product_id for p in candidates}
-    assert "P001" in pids, "MOCK_PRODUCTS should be in fallback"
+    mock_ids = {p.product_id for p in MOCK_PRODUCTS}
+    assert pids.issubset(mock_ids), "fallback candidates should come from MOCK_PRODUCTS"
     print(f"[OK] recall.no_profile: returned {len(candidates)} products from popularity")
 
 

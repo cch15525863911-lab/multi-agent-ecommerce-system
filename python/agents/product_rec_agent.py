@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-import random
 from typing import Any
 
 import structlog
@@ -209,7 +209,11 @@ class ProductRecAgent(BaseAgent):
             seen.add(p.product_id)
             candidates.append(p)
 
-        # --- Score-based sort with diversity boost ---
+        # --- Score-based sort with deterministic diversity boost ---
+        # 说明: 原先使用 random.random() 作为 tie-breaker, 导致同一输入每次
+        # 调用结果不同 (缓存失效/测试不稳定/线上行为不可复现)。
+        # 改为基于 product_id 的确定性 hash 打散: 同一商品集多次调用结果稳定,
+        # 同时保留"同等条件下不总是同一顺序"的展示多样性。
         if profile and profile.preferred_categories:
             preferred = set(profile.preferred_categories)
             candidates.sort(
@@ -217,13 +221,17 @@ class ProductRecAgent(BaseAgent):
                     p.score,
                     p.category in preferred,
                     p.stock > 0,
-                    random.random(),
+                    int(hashlib.md5(p.product_id.encode()).hexdigest()[:8], 16),
                 ),
                 reverse=True,
             )
         else:
             candidates.sort(
-                key=lambda p: (p.score, p.stock > 0, random.random()),
+                key=lambda p: (
+                    p.score,
+                    p.stock > 0,
+                    int(hashlib.md5(p.product_id.encode()).hexdigest()[:8], 16),
+                ),
                 reverse=True,
             )
 

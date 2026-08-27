@@ -88,12 +88,22 @@ kg_store: KGStore | None = None
 async def lifespan(app: FastAPI):
     global rec_graph, dynamic_engine, guardrails_gate, tracer, workflow_worker, kg_store
 
-    # P0 安全校验: 开启鉴权时必须配置 JWT 密钥, 缺失则拒绝启动 (fail-fast)
-    if settings.guardrails_jwt_enabled and not settings.jwt_secret:
-        raise RuntimeError(
-            "安全合规要求: guardrails_jwt_enabled=True 但 jwt_secret 未配置。"
-            "请通过环境变量 ECOM_JWT_SECRET 注入强密钥 (缺失则拒绝启动)。"
-        )
+    # P0 安全校验: 开启鉴权时必须配置强 JWT 密钥, 否则拒绝启动 (fail-fast)
+    #  - 密钥缺失或 <32 字符 → 拒绝启动 (弱密钥等于没有鉴权)
+    #  - 生产环境 (debug=False) 使用 dev- 占位密钥 → 拒绝启动 (防止占位密钥上线)
+    # 本地调试: 复制 .env.example, 使用其中 dev- 占位密钥即可正常启动。
+    if settings.guardrails_jwt_enabled:
+        secret = settings.jwt_secret
+        if not secret or len(secret) < 32:
+            raise RuntimeError(
+                "安全合规要求: guardrails_jwt_enabled=True 但 ECOM_JWT_SECRET 缺失或长度不足 32 字符。"
+                "请通过环境变量注入强密钥 (缺失则拒绝启动); 本地开发可复制 .env.example 使用占位密钥。"
+            )
+        if secret.startswith("dev-") and not settings.debug:
+            raise RuntimeError(
+                "安全合规要求: 检测到开发占位密钥 (dev- 前缀), 生产环境禁止使用。"
+                "请通过环境变量 ECOM_JWT_SECRET 注入随机强密钥; 仅本地调试可设置 ECOM_DEBUG=true。"
+            )
 
     init_db_connection()
 

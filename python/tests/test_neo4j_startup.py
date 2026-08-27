@@ -33,8 +33,8 @@ if "uvicorn" not in sys.modules:
 
 async def test_lifespan_calls_kg_connect() -> None:
     """lifespan startup should call kg_store.connect()."""
-    # 开启鉴权后启动需 JWT 密钥, 注入测试密钥避免启动报错 (fail-fast 校验)
-    os.environ["ECOM_JWT_SECRET"] = "test-secret-for-lifespan"
+    # 开启鉴权后启动需 JWT 密钥, 注入测试密钥避免启动报错 (fail-fast 校验要求 ≥32 字符)
+    os.environ["ECOM_JWT_SECRET"] = "test-only-jwt-secret-for-lifespan-0123456789"
     from config import get_settings
 
     get_settings.cache_clear()
