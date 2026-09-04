@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import hashlib
-import random
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -35,7 +34,12 @@ logger = structlog.get_logger()
 # =========================================================================
 
 _user_credit_profile: dict[str, dict[str, Any]] = {}
+# 风控评分审计日志 — 记录每次 check_fraud 的评分结果，供 get_fraud_history 追溯。
+# 注意: 这是「审计」而非「判据」，不参与风险评分。若让评分结果反向喂给规则引擎，
+# 会形成自我实现的预言: 命中一次 → 写入历史 → 判定为"有欺诈史" → 权重 50 → 永久高风险。
 _user_fraud_history: dict[str, list[dict[str, Any]]] = {}
+# 已确认欺诈用户名单 — 需人工复核或外部系统显式标记才置位，是 R006 的唯一判据。
+_confirmed_fraud_users: set[str] = set()
 _user_refund_history: dict[str, list[dict[str, Any]]] = {}
 _blacklist_ips: set[str] = set()
 _blacklist_devices: set[str] = set()
@@ -114,10 +118,11 @@ FRAUD_RULES = [
     },
     {
         "rule_id": "R006",
-        "rule_name": "历史欺诈记录",
+        "rule_name": "已确认欺诈用户",
         "weight": 50,
-        "check": lambda ctx: ctx.get("has_fraud_history", False),
-        "description": "用户存在历史欺诈交易记录",
+        # 只认"已确认"名单，不认评分历史 —— 避免评分结果自我放大为永久高风险
+        "check": lambda ctx: ctx.get("user_id") in _confirmed_fraud_users,
+        "description": "用户经人工复核或外部系统确认为欺诈",
     },
     {
         "rule_id": "R007",
@@ -147,8 +152,14 @@ async def check_fraud(
     device_id: str | None = None,
     ip_address: str | None = None,
     order_id: str | None = None,
+    city_mismatch: bool | None = None,
+    order_count_1h: int | None = None,
 ) -> dict[str, Any]:
     """实时反欺诈检测 — 规则引擎 + 风险评分。
+
+    评分对同一组入参完全可复现: 演示特征 (异地登录 / 近 1 小时下单数) 由 user_id
+    确定性派生而非 random —— 与 product_rec_agent._recall 的修复方式保持一致。
+    调用方也可显式传入这两个特征覆盖派生值 (便于测试或对接真实特征平台)。
 
     Args:
         user_id: 用户ID
@@ -157,10 +168,16 @@ async def check_fraud(
         device_id: 设备指纹
         ip_address: 客户端IP
         order_id: 订单号 (可选)
+        city_mismatch: 下单城市与常用收货地不一致 (None=按 user_id 确定性派生)
+        order_count_1h: 近 1 小时下单次数 (None=按 user_id 确定性派生)
 
     Returns:
         {risk_level, risk_score, rules_hit, recommended_action, needs_human_review}
     """
+    # 演示特征: 基于 user_id 的确定性派生 (约 10% 用户命中异地, 下单数 0~7)。
+    # 说明: 原先使用 random.randint / random.random, 导致同一入参每次评分不同,
+    # 测试约 10% 概率失败 (见 test_normal_transaction_low_risk)。
+    _fp = int(hashlib.md5(user_id.encode()).hexdigest()[:8], 16)
     ctx = {
         "user_id": user_id,
         "amount": amount,
@@ -169,9 +186,9 @@ async def check_fraud(
         "ip_address": ip_address,
         "order_id": order_id,
         "is_new_user": user_id.startswith("new_"),
-        "has_fraud_history": len(_user_fraud_history.get(user_id, [])) > 0,
-        "order_count_1h": random.randint(0, 3),  # 演示: 模拟实时特征
-        "city_mismatch": random.random() < 0.1,  # 演示: 10%概率异地
+        "order_count_1h": order_count_1h if order_count_1h is not None else _fp % 8,
+        "city_mismatch": (city_mismatch if city_mismatch is not None
+                          else (_fp >> 8) % 10 == 0),
     }
 
     rules_hit: list[FraudRuleHit] = []
@@ -193,7 +210,7 @@ async def check_fraud(
     risk_level, action = _calculate_risk_level(total_score)
     needs_review = risk_level in (FraudRiskLevel.HIGH, FraudRiskLevel.CRITICAL)
 
-    # 记录到历史
+    # 写入评分审计日志 (仅用于追溯/统计, 不参与风险评分 —— 见 _user_fraud_history 注释)
     if total_score > 0:
         _user_fraud_history.setdefault(user_id, []).append({
             "order_id": order_id,
@@ -231,15 +248,21 @@ async def get_fraud_history(user_id: str, limit: int = 20) -> dict[str, Any]:
 
 
 async def add_to_blacklist(
-    item_type: str,  # "ip" | "device"
+    item_type: str,  # "ip" | "device" | "user"
     value: str,
     reason: str = "",
 ) -> dict[str, Any]:
-    """将IP或设备加入黑名单."""
+    """将 IP / 设备 / 用户加入黑名单。
+
+    item_type="user" 会把用户标记为「已确认欺诈」，这是 R006 的唯一触发途径 ——
+    风控引擎不会仅因某次评分偏高就把用户永久钉死为高风险。
+    """
     if item_type == "ip":
         _blacklist_ips.add(value)
     elif item_type == "device":
         _blacklist_devices.add(value)
+    elif item_type == "user":
+        _confirmed_fraud_users.add(value)
     else:
         return {"status": "error", "message": f"unknown type: {item_type}"}
     return {"status": "added", "type": item_type, "value": value, "reason": reason}

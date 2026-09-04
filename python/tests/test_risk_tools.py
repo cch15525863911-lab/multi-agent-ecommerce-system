@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from services.risk_tools import (
+    _confirmed_fraud_users,
     _user_credit_profile,
     _user_fraud_history,
     _user_refund_history,
@@ -29,6 +30,7 @@ from services.risk_tools import (
 def reset_state():
     """每个测试前重置内存状态, 避免互相影响。"""
     _user_fraud_history.clear()
+    _confirmed_fraud_users.clear()
     _user_refund_history.clear()
     # 信用档案保留默认种子数据, 测试中修改的话单独处理
 
@@ -79,6 +81,41 @@ class TestFraudDetection:
         # low → allow
         low = await check_fraud("user_001", 50.0, "alipay")
         assert low["recommended_action"] == "allow"
+
+    @pytest.mark.asyncio
+    async def test_scoring_is_deterministic(self):
+        """同一组入参重复调用, 评分必须完全一致 (不得依赖 random)。"""
+        results = [await check_fraud("user_001", 100.0, "alipay") for _ in range(5)]
+        scores = {r["risk_score"] for r in results}
+        assert len(scores) == 1, f"评分不可复现: {scores}"
+
+    @pytest.mark.asyncio
+    async def test_no_self_pollution(self):
+        """命中规则后重复调用不应自我放大 —— 评分历史不参与判分。"""
+        call = lambda: check_fraud(  # noqa: E731
+            "user_hist_probe", 500.0, "alipay", device_id="risky_device_001"
+        )
+        first, second = await call(), await call()
+        assert first["risk_score"] == second["risk_score"], (
+            f"评分被审计日志放大: {first['risk_score']} → {second['risk_score']}"
+        )
+        assert second["risk_score"] < 50  # 不应因历史叠加 R006 的 50 分
+
+    @pytest.mark.asyncio
+    async def test_confirmed_fraud_user_triggers_r006(self):
+        """R006 只由「已确认欺诈」名单触发, 而非评分历史。"""
+        before = await check_fraud("user_confirmed", 100.0, "alipay")
+        await add_to_blacklist("user", "user_confirmed", "人工复核确认")
+        after = await check_fraud("user_confirmed", 100.0, "alipay")
+        assert after["risk_score"] - before["risk_score"] == 50  # R006 权重
+        assert any(r["rule_id"] == "R006" for r in after["rules_hit"])
+
+    @pytest.mark.asyncio
+    async def test_feature_override(self):
+        """显式传入演示特征应覆盖自动派生 (便于对接真实特征平台)。"""
+        base = await check_fraud("user_001", 100.0, "alipay")
+        flagged = await check_fraud("user_001", 100.0, "alipay", city_mismatch=True)
+        assert flagged["risk_score"] - base["risk_score"] == 20  # R004 权重
 
 
 # =========================================================================

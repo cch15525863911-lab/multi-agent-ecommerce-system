@@ -45,9 +45,6 @@ class Settings(BaseSettings):
     neo4j_password: SecretStr = SecretStr("")
     neo4j_database: str = "neo4j"
 
-    # Profile source switch: "kg" (Neo4j, Cypher-based) or "redis" (legacy, LLM-based)
-    profile_source: str = "kg"
-
     # A/B Testing
     ab_test_enabled: bool = True
     ab_test_default_bucket_count: int = 100

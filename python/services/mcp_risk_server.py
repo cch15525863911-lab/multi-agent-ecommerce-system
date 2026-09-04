@@ -7,7 +7,7 @@ MCP 风控工具服务器 — 用 MCP 协议封装反欺诈/信用/退款三类�
 反欺诈工具:
     check_fraud              → 实时反欺诈检测 (规则引擎 + 风险评分)
     get_fraud_history        → 查询用户欺诈历史
-    add_to_blacklist         → 将IP/设备加入黑名单
+    add_to_blacklist         → 将 IP / 设备 / 用户加入黑名单 (user 即标记为已确认欺诈)
 
 信用授信工具:
     get_credit_profile       → 查询用户信用档案
@@ -64,11 +64,15 @@ def _build_server() -> "FastMCP":
         device_id: str | None = None,
         ip_address: str | None = None,
         order_id: str | None = None,
+        city_mismatch: bool | None = None,
+        order_count_1h: int | None = None,
     ) -> dict:
         """实时反欺诈检测 — 基于规则引擎的风险评分。
 
-        检测IP/设备黑名单、高频交易、异地登录、新用户大额、历史欺诈等规则，
+        检测IP/设备黑名单、高频交易、异地登录、新用户大额、已确认欺诈用户等规则，
         返回风险等级(low/medium/high/critical)和建议动作(allow/review/block)。
+
+        评分可复现: 同一组入参恒定返回相同结果。
 
         Args:
             user_id: 用户ID
@@ -77,12 +81,15 @@ def _build_server() -> "FastMCP":
             device_id: 设备指纹ID (可选)
             ip_address: 客户端IP地址 (可选)
             order_id: 关联订单号 (可选)
+            city_mismatch: 下单城市与常用收货地不一致 (可选, 不传则按 user_id 派生)
+            order_count_1h: 近 1 小时下单次数 (可选, 不传则按 user_id 派生)
 
         Returns:
             {risk_level, risk_score, rules_hit, recommended_action, needs_human_review}
         """
         return await rt.check_fraud(
-            user_id, amount, payment_method, device_id, ip_address, order_id
+            user_id, amount, payment_method, device_id, ip_address, order_id,
+            city_mismatch, order_count_1h,
         )
 
     @mcp.tool()
@@ -100,11 +107,12 @@ def _build_server() -> "FastMCP":
 
     @mcp.tool()
     async def add_to_blacklist(item_type: str, value: str, reason: str = "") -> dict:
-        """将IP地址或设备ID加入风险黑名单。
+        """将 IP / 设备 / 用户加入风险黑名单。
 
         Args:
-            item_type: 黑名单类型, "ip" 或 "device"
-            value: IP地址或设备ID
+            item_type: 黑名单类型, "ip" | "device" | "user"
+                       ("user" 会把用户标记为「已确认欺诈」, 是 R006 的唯一触发途径)
+            value: IP地址 / 设备ID / 用户ID
             reason: 加入黑名单的原因 (可选)
 
         Returns:

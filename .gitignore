@@ -42,3 +42,6 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+
+# WorkBuddy - AI 工作日志/记忆，仅本地使用，不入库
+.workbuddy/

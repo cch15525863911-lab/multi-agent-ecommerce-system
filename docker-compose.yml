@@ -22,7 +22,6 @@ services:
       - ECOM_NEO4J_USER=${NEO4J_USER:-neo4j}
       - ECOM_NEO4J_PASSWORD=${NEO4J_PASSWORD:?must set NEO4J_PASSWORD}
       - ECOM_NEO4J_DATABASE=neo4j
-      - ECOM_PROFILE_SOURCE=kg
     depends_on:
       redis:
         condition: service_healthy
@@ -30,8 +29,6 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      vllm:
-        condition: service_started
     restart: unless-stopped
 
   # Redis - Feature Store
@@ -103,8 +100,10 @@ services:
       retries: 8
 
   # vLLM - Local LLM Inference Server (OpenAI-compatible API, requires NVIDIA GPU)
+  # 默认不启动 (无 GPU 环境也能一键 up); 需要本地推理时: docker compose --profile gpu up -d
   vllm:
     image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
     ports:
       - "8001:8000"
     volumes:
